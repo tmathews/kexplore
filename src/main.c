@@ -1,9 +1,34 @@
+// TODO
+//  * Tabs
+// 	* Clicking item opens it or goes into directory
+// 	* Preview pane (or window?) to display visual file preview
+// 	* Navigation Area:
+// 		- Home button (go to user directory)
+// 		- Up button (go up 1 level)
+// 		- Refresh button (if for some reason it doesn't trigger?)
+// 		- URL bar (with button to favorite current directory)
+// 		- Toggle Sidebar
+// 		- Terminal button
+// 	* Sidebar:
+// 		- Sections can be collapsed
+// 		- Sections have little number indicators
+// 		- Sections:
+// 			- Bookmarked Directories
+// 			- Collections
+// 			- Tags
+// 	* Status bar (number of items in view, directory size in storage?)
+// 	* File List: (should be similar to ls)
+// 		- Icon, filename, created date, permissions, owner/group
+// 		- Scrollable (horzontally, vertically)
+
 #define STB_DS_IMPLEMENTATION
 
 #include <cairo/cairo.h>
 #include <dirent.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include "app.h"
 #include "klib/draw.h"
@@ -15,20 +40,15 @@ void draw(cairo_t *, struct surface_state *);
 void draw_entries(cairo_t *, int ox, int oy);
 void open_dir(const char *);
 
-struct entry {
-	char **name;
-};
-
 struct core {
 	char *cur_directory;
-	// struct entry *items;
 	struct dirent *items;
 } core;
 
 int main(int argc, char *argv[]) {
-	// core.cur_directory = "/home/thomas";
 	core.items = NULL;
-	open_dir("/home/thomas");
+	struct passwd *info = getpwuid(getuid());
+	open_dir(info->pw_dir);
 	app_init();
 	app.draw = &draw;
 	while (app_running()) {
