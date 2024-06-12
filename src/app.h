@@ -1,12 +1,13 @@
 #pragma once
 
 #include <cairo/cairo.h>
+#include <wayland-util.h>
 
 #include "klib/keyhold.h"
 #include "klib/waywrap.h"
 
 struct pointer {
-	int x, y, dx, dy;
+	wl_fixed_t x, y;
 	bool is_pressed;
 	bool is_released;
 	bool is_down;

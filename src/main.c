@@ -21,6 +21,7 @@
 // 		- Icon, filename, created date, permissions, owner/group
 // 		- Scrollable (horzontally, vertically)
 
+#include <wayland-util.h>
 #define STB_DS_IMPLEMENTATION
 
 #include <cairo/cairo.h>
@@ -43,7 +44,7 @@ void open_dir(const char *);
 struct core {
 	char *cur_directory;
 	struct dirent *items;
-	int x, y;
+	wl_fixed_t x, y, lx, ly;
 } core;
 
 int main(int argc, char *argv[]) {
@@ -56,9 +57,15 @@ int main(int argc, char *argv[]) {
 	app.draw = &draw;
 	while (app_running()) {
 		app_process();
+		if (app.pointer.is_pressed) {
+			core.lx = app.pointer.x;
+			core.ly = app.pointer.y;
+		}
 		if (app.pointer.is_down) {
-			core.x += app.pointer.dx;
-			core.y += app.pointer.dy;
+			core.x += app.pointer.x - core.lx;
+			core.y += app.pointer.y - core.ly;
+			core.lx = app.pointer.x;
+			core.ly = app.pointer.y;
 		}
 	}
 	app_free();
@@ -72,7 +79,7 @@ void draw(cairo_t *cr, struct surface_state *state) {
 	cairo_rectangle(cr, 0, 0, w, h);
 	cairo_set_source_rgba(cr, 0, 0, 0, 0.8);
 	cairo_fill(cr);
-	draw_entries(cr, core.x, core.y);
+	draw_entries(cr, wl_fixed_to_int(core.x), wl_fixed_to_int(core.y));
 }
 
 void draw_entries(cairo_t *cr, int ox, int oy) {

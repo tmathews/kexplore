@@ -62,30 +62,29 @@ bool app_running() {
 }
 
 void app_process_pointer() {
-	app.pointer.dx = 0;
-	app.pointer.dy = 0;
+	app.pointer.is_released = false;
+	app.pointer.is_pressed = false;
 	if (app.state->active_surface_pointer == NULL)
 		return;
+	if (app.state->active_surface_pointer->pointer == NULL)
+		return;
 	struct pointer_event *pe = app.state->active_surface_pointer->pointer;
+	app.state->active_surface_pointer->pointer = NULL;
 	for (; pe != NULL; pe = pe->next) {
 		if (pe->event_mask & POINTER_EVENT_MOTION) {
-			int x = wl_fixed_to_int(pe->surface_x);
-			int y = wl_fixed_to_int(pe->surface_y);
-			app.pointer.dx = x - app.pointer.x;
-			app.pointer.dy = y - app.pointer.y;
-			app.pointer.x = x;
-			app.pointer.y = y;
+			app.pointer.x = pe->surface_x;
+			app.pointer.y = pe->surface_y;
 		}
 		if (pe->event_mask & POINTER_EVENT_BUTTON) {
 			if (pe->button == 272) {
-				bool was_down = app.pointer.is_down;
-				app.pointer.is_down = pe->state == 1;
-				if (was_down && !app.pointer.is_down) {
-					app.pointer.is_released = true;
-				}
+				bool down = pe->state == 1;
+				app.pointer.is_released = (app.pointer.is_down && !down);
+				app.pointer.is_pressed = (!app.pointer.is_down && down);
+				app.pointer.is_down = down;
 			}
 		}
 	}
+	pointer_event_free(pe);
 }
 
 void app_process() {

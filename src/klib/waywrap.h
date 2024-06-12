@@ -169,6 +169,8 @@ void wl_pointer_axis_discrete(
 );
 void wl_pointer_frame(void *, struct wl_pointer *);
 
+void pointer_event_free(struct pointer_event *ev);
+
 // Keyboard
 void wl_keyboard_keymap(
 	void *, struct wl_keyboard *, uint32_t format, int32_t fd, uint32_t size
