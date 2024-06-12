@@ -43,16 +43,23 @@ void open_dir(const char *);
 struct core {
 	char *cur_directory;
 	struct dirent *items;
+	int x, y;
 } core;
 
 int main(int argc, char *argv[]) {
 	core.items = NULL;
+	core.x = 0;
+	core.y = 0;
 	struct passwd *info = getpwuid(getuid());
 	open_dir(info->pw_dir);
 	app_init();
 	app.draw = &draw;
 	while (app_running()) {
 		app_process();
+		if (app.pointer.is_down) {
+			core.x += app.pointer.dx;
+			core.y += app.pointer.dy;
+		}
 	}
 	app_free();
 	return 0;
@@ -65,7 +72,7 @@ void draw(cairo_t *cr, struct surface_state *state) {
 	cairo_rectangle(cr, 0, 0, w, h);
 	cairo_set_source_rgba(cr, 0, 0, 0, 0.8);
 	cairo_fill(cr);
-	draw_entries(cr, 10, 10);
+	draw_entries(cr, core.x, core.y);
 }
 
 void draw_entries(cairo_t *cr, int ox, int oy) {

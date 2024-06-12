@@ -1,4 +1,6 @@
 #include "app.h"
+#include "klib/waywrap.h"
+#include <wayland-util.h>
 
 extern struct app app;
 
@@ -8,6 +10,12 @@ void app_init() {
 	struct client_state *state = client_state_new();
 	state->on_keyboard = app_on_keyboard;
 	app.state = state;
+	app.pointer.x = 0;
+	app.pointer.y = 0;
+	app.pointer.last_time = 0;
+	app.pointer.is_down = false;
+	app.pointer.is_pressed = false;
+	app.pointer.is_released = false;
 	app.draw = NULL;
 	struct surface_state *a;
 	a = surface_state_new(state, "Kallos Explore", width, height);
@@ -53,10 +61,38 @@ bool app_running() {
 	return app.state->root_surface != NULL;
 }
 
+void app_process_pointer() {
+	app.pointer.dx = 0;
+	app.pointer.dy = 0;
+	if (app.state->active_surface_pointer == NULL)
+		return;
+	struct pointer_event *pe = app.state->active_surface_pointer->pointer;
+	for (; pe != NULL; pe = pe->next) {
+		if (pe->event_mask & POINTER_EVENT_MOTION) {
+			int x = wl_fixed_to_int(pe->surface_x);
+			int y = wl_fixed_to_int(pe->surface_y);
+			app.pointer.dx = x - app.pointer.x;
+			app.pointer.dy = y - app.pointer.y;
+			app.pointer.x = x;
+			app.pointer.y = y;
+		}
+		if (pe->event_mask & POINTER_EVENT_BUTTON) {
+			if (pe->button == 272) {
+				bool was_down = app.pointer.is_down;
+				app.pointer.is_down = pe->state == 1;
+				if (was_down && !app.pointer.is_down) {
+					app.pointer.is_released = true;
+				}
+			}
+		}
+	}
+}
+
 void app_process() {
 	wl_display_dispatch(app.state->wl_display);
 	keyhold_process(
 		app.keyhold_root, app.state->key_repeat_delay,
 		app.state->key_repeat_rate, app_on_keyrepeat
 	);
+	app_process_pointer();
 }

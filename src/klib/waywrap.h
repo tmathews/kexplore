@@ -36,6 +36,7 @@ struct axe {
 };
 
 struct pointer_event {
+	uint32_t id;
 	uint32_t event_mask;
 	wl_fixed_t surface_x, surface_y;
 	uint32_t button, state;
@@ -43,6 +44,7 @@ struct pointer_event {
 	uint32_t serial;
 	uint32_t axis_source;
 	struct axe axes[2];
+	struct pointer_event *next;
 };
 
 struct client_state {

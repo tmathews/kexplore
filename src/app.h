@@ -5,10 +5,19 @@
 #include "klib/keyhold.h"
 #include "klib/waywrap.h"
 
+struct pointer {
+	int x, y, dx, dy;
+	bool is_pressed;
+	bool is_released;
+	bool is_down;
+	uint32_t last_time;
+};
+
 struct app {
 	struct client_state *state;
 	struct surface_state *surf_state;
 	struct keyhold *keyhold_root;
+	struct pointer pointer;
 	void (*draw)(cairo_t *, struct surface_state *);
 };
 
