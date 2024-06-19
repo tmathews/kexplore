@@ -3,10 +3,6 @@
 #include <dirent.h>
 #include <stdbool.h>
 
-struct point {
-	int x, y;
-};
-
 struct node_item {
 	struct dirent info;
 	bool selected;
@@ -16,7 +12,7 @@ struct node {
 	char *filepath;
 	struct node_item *items;
 	struct node *parent;
-	struct node *children;
+	struct node *next; // next is the next open node
 	bool open;
 };
 
