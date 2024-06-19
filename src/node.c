@@ -9,6 +9,7 @@
 #include "geometry.h"
 #include "node.h"
 #include "stb_ds.h"
+#include "utils.h"
 
 struct node *node_open(const char *filepath) {
 	DIR *dp;
@@ -47,11 +48,7 @@ bool node_open_child(struct node *n, const char *name) {
 	if (n->next != NULL) {
 		node_close(n->next);
 	}
-	char *npath = malloc(strlen(n->filepath) + strlen(name) + 2);
-	npath[0] = 0;
-	strcpy(npath, n->filepath);
-	strcat(npath, "/");
-	strcat(npath, name);
+	char *npath = string_path_join(n->filepath, name);
 	struct node *child = node_open(npath);
 	free(npath);
 	if (child == NULL) {

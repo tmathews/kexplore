@@ -28,6 +28,7 @@
 #include "klib/waywrap.h"
 #include "node.h"
 #include "stb_ds.h"
+#include "utils.h"
 
 struct hitbox {
 	struct rectangle area;
@@ -45,6 +46,8 @@ struct core {
 	struct point camera;
 	struct node *root;
 	struct hitbox *boxes;
+	char *selected_file;
+	bool is_dragging;
 } core;
 
 struct app app;
@@ -58,6 +61,8 @@ int main(int argc, char *argv[]) {
 	core.camera.x = 0;
 	core.camera.y = 0;
 	core.boxes = NULL;
+	core.selected_file = NULL;
+	core.is_dragging = false;
 	struct passwd *info = getpwuid(getuid());
 	core.root = node_open(info->pw_dir);
 	if (core.root == NULL) {
@@ -92,23 +97,48 @@ void process() {
 	if (app.pointer.is_released) {
 		int x = core.camera.x + wl_fixed_to_int(app.pointer.x);
 		int y = core.camera.y + wl_fixed_to_int(app.pointer.y);
-		// printf(
-		//	"core: %d %d | released: %d, %d\n", -wl_fixed_to_int(core.x),
-		//	-wl_fixed_to_int(core.y), x, y
-		// );
-		for (int i = 0; i < arrlen(core.boxes); i++) {
-			struct hitbox box = core.boxes[i];
-			// printf(
-			//	"%d %d %d %d\n", box.area.min.x, box.area.min.y, box.area.max.x,
-			//	box.area.max.y
-			//);
-			if (rectangle_contains(&box.area, x, y)) {
-				printf("hit: %d!\n", box.trigger);
-				// TODO trigger a thing!
-				break;
+		if (!core.is_dragging) {
+			for (int i = 0; i < arrlen(core.boxes); i++) {
+				struct hitbox box = core.boxes[i];
+				if (rectangle_contains(&box.area, x, y)) {
+					printf("hit: %d!\n", box.trigger);
+					struct ev_entry *e = box.userdata;
+					printf(
+						"hit info: %s, index: %d, filename: %s\n",
+						e->n->filepath, e->i, e->n->items[e->i].info.d_name
+					);
+					if (e->n->items[e->i].info.d_type == DT_DIR) {
+						printf("opening...\n");
+						node_open_child(e->n, e->n->items[e->i].info.d_name);
+						if (core.selected_file != NULL) {
+							free(core.selected_file);
+							core.selected_file = NULL;
+						}
+					} else {
+						if (core.selected_file != NULL) {
+							free(core.selected_file);
+						}
+						core.selected_file = string_path_join(
+							e->n->filepath, e->n->items[e->i].info.d_name
+						);
+					}
+					break;
+				}
 			}
 		}
 	}
+}
+
+void draw_selection(cairo_t *cr, const char *filepath) {
+	if (core.selected_file == NULL) {
+		return;
+	}
+	cairo_select_font_face(
+		cr, "Noto Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL
+	);
+	cairo_set_font_size(cr, 18);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	draw_text(cr, core.selected_file, 0, 16);
 }
 
 void draw(cairo_t *cr, struct surface_state *state) {
@@ -126,6 +156,7 @@ void draw(cairo_t *cr, struct surface_state *state) {
 	core.boxes = NULL;
 	// Draw things
 	draw_entries(cr, core.root, (struct point){});
+	draw_selection(cr, core.selected_file);
 }
 
 void draw_entries(cairo_t *cr, struct node *n, struct point offset) {
@@ -150,13 +181,13 @@ void draw_entries(cairo_t *cr, struct node *n, struct point offset) {
 		cairo_set_font_size(cr, 18);
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		for (int i = 0; i < len; i++) {
-			struct node_item item = core.root->items[i];
+			struct node_item item = n->items[i];
 			draw_text(cr, item.info.d_name, dx + 5, dy + 16 + 5);
 			struct hitbox hitbox;
 			hitbox.area.min.x = offset.x + 5;
-			hitbox.area.min.y = offset.y + 5;
+			hitbox.area.min.y = offset.y + (i * 24) + 5;
 			hitbox.area.max.x = offset.x + 300;
-			hitbox.area.max.y = offset.y + (i * 24) + 5;
+			hitbox.area.max.y = offset.y + (i * 24) + 5 + 16;
 			hitbox.trigger = 1;
 			struct ev_entry *e = calloc(1, sizeof(struct ev_entry));
 			e->n = n;
