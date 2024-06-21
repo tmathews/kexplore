@@ -6,7 +6,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "geometry.h"
+#include "klib/geometry.h"
 #include "node.h"
 #include "stb_ds.h"
 #include "utils.h"

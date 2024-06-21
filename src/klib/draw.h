@@ -1,7 +1,11 @@
 #pragma once
 
 #include <cairo/cairo.h>
+#include <pango/pango-layout.h>
+#include <pango/pangocairo.h>
 #include <string.h>
+
+#include "geometry.h"
 
 #define M_PI 3.14159265358979323846
 
@@ -41,4 +45,31 @@ double draw_text(cairo_t *cr, const char *str, int origin_x, int origin_y) {
 		cairo_show_text(cr, letter);
 	}
 	return x;
+}
+
+struct point
+text_size(cairo_t *cr, PangoFontDescription *desc, const char *str) {
+	struct point pt;
+	PangoLayout *layout = pango_cairo_create_layout(cr);
+	pango_layout_set_font_description(layout, desc);
+	pango_layout_set_text(layout, str, -1);
+	pango_layout_get_size(layout, &pt.x, &pt.y);
+	g_object_unref(layout);
+	pt.x /= PANGO_SCALE;
+	pt.y /= PANGO_SCALE;
+	return pt;
+}
+
+struct point
+draw_text2(cairo_t *cr, PangoFontDescription *desc, const char *str) {
+	struct point pt;
+	PangoLayout *layout = pango_cairo_create_layout(cr);
+	pango_layout_set_font_description(layout, desc);
+	pango_layout_set_text(layout, str, -1);
+	pango_layout_get_size(layout, &pt.x, &pt.y);
+	pango_cairo_show_layout(cr, layout);
+	g_object_unref(layout);
+	pt.x /= PANGO_SCALE;
+	pt.y /= PANGO_SCALE;
+	return pt;
 }

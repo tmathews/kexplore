@@ -1,4 +1,4 @@
-FLAGS = $(shell pkg-config --cflags --libs librsvg-2.0)
+FLAGS = $(shell pkg-config --cflags --libs librsvg-2.0 pangocairo)
 FILES = $(shell find src -type f -iname *.c -o -iname *.h)
 
 build: protocol

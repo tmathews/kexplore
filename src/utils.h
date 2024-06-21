@@ -5,3 +5,6 @@ char *string_concat(const char *, const char *);
 // Will create a new string by joining a and b with a /. You must free it
 // later.
 char *string_path_join(const char *, const char *);
+
+int open_file(const char *filepath);
+int run_cmd(const char *str);

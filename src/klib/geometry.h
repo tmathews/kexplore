@@ -11,4 +11,5 @@ struct rectangle {
 	struct point max;
 };
 
+struct point rectangle_size(const struct rectangle *r);
 bool rectangle_contains(const struct rectangle *r, int x, int y);
