@@ -12,11 +12,11 @@
 // 	- collection & tag view
 // 	- bookmarks pane that allows you to jump to a directory quickly
 // 	- add bookmark by selecting directory and clicking a star/bookmark icon
-#include "pango/pango-font.h"
 #define STB_DS_IMPLEMENTATION
 
 #include <cairo/cairo.h>
 #include <dirent.h>
+#include <pango/pango-font.h>
 #include <pango/pangocairo.h>
 #include <pwd.h>
 #include <stdio.h>
@@ -155,6 +155,10 @@ void process() {
 							core.selected_file = string_path_join(
 								e->n->filepath, e->n->items[e->i].info.d_name
 							);
+							if (e->n->next != NULL) {
+								node_close(e->n->next);
+								e->n->next = NULL;
+							}
 						}
 					}
 					break;

@@ -2,6 +2,7 @@
 #include <dirent.h>
 #include <pwd.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -10,6 +11,12 @@
 #include "node.h"
 #include "stb_ds.h"
 #include "utils.h"
+
+int node_item_sort(const void *a, const void *b) {
+	struct node_item *aa = (struct node_item *)a;
+	struct node_item *bb = (struct node_item *)b;
+	return strcmp(aa->info.d_name, bb->info.d_name);
+}
 
 struct node *node_open(const char *filepath) {
 	DIR *dp;
@@ -32,6 +39,7 @@ struct node *node_open(const char *filepath) {
 		arrput(n->items, item);
 	}
 	closedir(dp);
+	qsort(n->items, arrlen(n->items), sizeof(struct node_item), node_item_sort);
 	return n;
 }
 
