@@ -137,22 +137,18 @@ void process() {
 					} else {
 						printf("hit selection\n");
 						core.selection = *e;
+						if (core.selected_file != NULL) {
+							free(core.selected_file);
+						}
+						core.selected_file = string_path_join(
+							e->n->filepath, e->n->items[e->i].info.d_name
+						);
 						if (e->n->items[e->i].info.d_type == DT_DIR) {
 							printf("opening...\n");
 							node_open_child(
 								e->n, e->n->items[e->i].info.d_name
 							);
-							if (core.selected_file != NULL) {
-								free(core.selected_file);
-								core.selected_file = NULL;
-							}
 						} else {
-							if (core.selected_file != NULL) {
-								free(core.selected_file);
-							}
-							core.selected_file = string_path_join(
-								e->n->filepath, e->n->items[e->i].info.d_name
-							);
 							if (e->n->next != NULL) {
 								node_close(e->n->next);
 								e->n->next = NULL;
