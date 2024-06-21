@@ -85,8 +85,6 @@ int main(int argc, char *argv[]) {
 		printf("failed to load node\n");
 		exit(1);
 	}
-	node_open_child(core.root, "tmp");
-	printf("loaded %d items\n", (int)arrlen(core.root->items));
 	app_init();
 	app.draw = &draw;
 	while (app_running()) {
