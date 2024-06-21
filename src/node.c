@@ -18,6 +18,14 @@ int node_item_sort(const void *a, const void *b) {
 	return strcmp(aa->info.d_name, bb->info.d_name);
 }
 
+bool node_is_item(struct node *n, struct node_item *item) {
+	if (n == NULL || item == NULL)
+		return false;
+	char *name = strrchr(n->filepath, '/');
+	name += 1;
+	return strcmp(name, item->info.d_name) == 0;
+}
+
 struct node *node_open(const char *filepath) {
 	DIR *dp;
 	struct dirent *ep;

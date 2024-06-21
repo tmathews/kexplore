@@ -16,6 +16,7 @@ struct node {
 	bool open;
 };
 
+bool node_is_item(struct node *n, struct node_item *item);
 struct node *node_open(const char *);
 void node_close(struct node *);
 struct point node_calc_size(struct node *);

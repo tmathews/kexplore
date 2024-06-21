@@ -276,6 +276,9 @@ void draw_entries(cairo_t *cr, struct node *n, struct point offset) {
 				cairo_set_line_width(cr, 3);
 				cairo_stroke(cr);
 			}
+			if (node_is_item(n->next, &item)) {
+				offset.y = cursor.y + core.camera.y;
+			}
 			cursor.y += tsize.y;
 			size.y += tsize.y + 5;
 		}
