@@ -178,10 +178,10 @@ void draw_selection(cairo_t *cr, const char *filepath) {
 
 	struct point size = text_size(cr, core.fonts.normal, text);
 	path_rounded_rect(cr, 5.5, 5.5, size.x + 10, size.y + 5, 10);
-	cairo_set_source_rgba(cr, 1, 1, 1, 0.3);
+	cairo_set_source_rgba(cr, 0, 0, 0, 1);
 	cairo_set_line_width(cr, 2);
 	cairo_fill_preserve(cr);
-	cairo_set_source_rgba(cr, 1, 1, 1, 0.7);
+	cairo_set_source_rgba(cr, 1, 1, 1, 1);
 	cairo_stroke(cr);
 
 	cairo_set_source_rgb(cr, 1, 1, 1);
@@ -226,9 +226,13 @@ void draw_entries(cairo_t *cr, struct node *n, struct point offset) {
 		for (int i = 0; i < len; i++) {
 			struct node_item item = n->items[i];
 			bool selected = core.selection.n == n && i == core.selection.i;
+			bool is_highlighted = node_is_item(n->next, &item);
 			cursor.y += 5;
 			cairo_move_to(cr, cursor.x, cursor.y);
-			if (selected) {
+			if (is_highlighted) {
+				offset.y = cursor.y + core.camera.y;
+			}
+			if (selected || is_highlighted) {
 				cairo_set_source_rgb(cr, 1, 0, 0);
 			} else {
 				cairo_set_source_rgb(cr, 1, 1, 1);
@@ -275,9 +279,6 @@ void draw_entries(cairo_t *cr, struct node *n, struct point offset) {
 				cairo_set_source_rgb(cr, 1, 0, 1);
 				cairo_set_line_width(cr, 3);
 				cairo_stroke(cr);
-			}
-			if (node_is_item(n->next, &item)) {
-				offset.y = cursor.y + core.camera.y;
 			}
 			cursor.y += tsize.y;
 			size.y += tsize.y + 5;
