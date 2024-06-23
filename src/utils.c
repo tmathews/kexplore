@@ -45,7 +45,7 @@ int open_file(const char *filepath, const struct file_handler *handlers) {
 	bool found = false;
 	for (int i = 0; i < arrlen(handlers); i++) {
 		for (int n = 0; n < arrlen(handlers[i].exts); n++) {
-			if (strcmp(handlers[i].exts[n], ext) == 0) {
+			if (strcasecmp(handlers[i].exts[n], ext) == 0) {
 				h = handlers[i];
 				found = true;
 				break;
