@@ -57,6 +57,7 @@ struct core {
 	struct ev_entry selection;
 	bool is_dragging;
 	struct fonts fonts;
+	struct file_handler *fhandlers;
 } core;
 
 struct app app;
@@ -84,6 +85,17 @@ int main(int argc, char *argv[]) {
 	if (core.root == NULL) {
 		printf("failed to load node\n");
 		exit(1);
+	}
+	{
+		char *fname = string_path_join(info->pw_dir, ".config/kallos/handlers");
+		core.fhandlers = read_handlers(fname);
+		free(fname);
+		// for (int i = 0; i < arrlen(core.fhandlers); i++) {
+		//	printf("new handler: '%s'!\n", core.fhandlers[i].command);
+		//	for (int n = 0; n < arrlen(core.fhandlers[i].exts); n++) {
+		//		printf("\t'%s'\n", core.fhandlers[i].exts[n]);
+		//	}
+		// }
 	}
 	app_init();
 	app.draw = &draw;
@@ -132,7 +144,7 @@ void process() {
 						char *filepath = string_path_join(
 							e->n->filepath, e->n->items[e->i].info.d_name
 						);
-						open_file(filepath);
+						open_file(filepath, core.fhandlers);
 						free(filepath);
 					} else {
 						printf("hit selection\n");
