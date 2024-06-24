@@ -2,16 +2,25 @@
 // collections of files. Freely explore your file system like it's a big map.
 //
 // TODO
-// 	- open nodes by clicking on directory
-// 	- double click to open file
-// 	- preview image pane
-// 	- quick go to home directory node
+//  - upon open center camera on target node
+//  - have icons for directories
+//  - show a nice button for opening files (that are recognized)
+//  - node navigation buttons:
+//  	* jump to parent
+//  	* jump to home
+//  	* bookmark current url
+//  	* copy current url
+//  - keyboard navigation:
+//  	* h/left, l/right for out of and into directory
+//  	* j/k/up/down for current node index traversal
+// 	- preview image pane with support for: svg, gif, jpeg, png, webp, etc.
 // 	- middle mouse button to pan
+// 	- customize pan speed
 // 	- tag file by selecting it and then going to the tag pane and editing them
 // 	- add file to collection by selecting it and adding it to collection
 // 	- collection & tag view
 // 	- bookmarks pane that allows you to jump to a directory quickly
-// 	- add bookmark by selecting directory and clicking a star/bookmark icon
+// 	- zoom?
 #define STB_DS_IMPLEMENTATION
 
 #include <cairo/cairo.h>
@@ -58,6 +67,7 @@ struct core {
 	bool is_dragging;
 	struct fonts fonts;
 	struct file_handler *fhandlers;
+	cairo_surface_t *preview_surface;
 } core;
 
 struct app app;
@@ -155,6 +165,10 @@ void process() {
 						core.selected_file = string_path_join(
 							e->n->filepath, e->n->items[e->i].info.d_name
 						);
+						if (core.preview_surface != NULL) {
+							cairo_surface_destroy(core.preview_surface);
+							core.preview_surface = NULL;
+						}
 						if (e->n->items[e->i].info.d_type == DT_DIR) {
 							printf("opening...\n");
 							node_open_child(
@@ -164,6 +178,12 @@ void process() {
 							if (e->n->next != NULL) {
 								node_close(e->n->next);
 								e->n->next = NULL;
+							}
+							if (is_file_ext(core.selected_file, ".png")) {
+								core.preview_surface =
+									cairo_image_surface_create_from_png(
+										core.selected_file
+									);
 							}
 						}
 					}
@@ -181,9 +201,7 @@ void draw_selection(cairo_t *cr, const char *filepath) {
 	} else {
 		text = core.selected_file;
 	}
-
 	cairo_move_to(cr, 5, 5);
-
 	struct point size = text_size(cr, core.fonts.normal, text);
 	path_rounded_rect(cr, 5.5, 5.5, size.x + 10, size.y + 5, 10);
 	cairo_set_source_rgba(cr, 0, 0, 0, 1);
@@ -191,15 +209,31 @@ void draw_selection(cairo_t *cr, const char *filepath) {
 	cairo_fill_preserve(cr);
 	cairo_set_source_rgba(cr, 1, 1, 1, 1);
 	cairo_stroke(cr);
-
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	cairo_move_to(cr, 10, 7);
 	draw_text2(cr, core.fonts.normal, text);
 }
 
+void draw_preview(cairo_t *cr, const char *filename, struct point window_size) {
+	if (core.preview_surface == NULL) {
+		return;
+	}
+	int size = 400;
+	int w = cairo_image_surface_get_width(core.preview_surface);
+	int h = cairo_image_surface_get_height(core.preview_surface);
+	float scale = (float)size / (float)w;
+	cairo_save(cr);
+	cairo_translate(cr, 10, window_size.y - 10 - (h * scale));
+	cairo_scale(cr, scale, scale);
+	cairo_set_source_surface(cr, core.preview_surface, 0, 0);
+	cairo_paint(cr);
+	cairo_restore(cr);
+}
+
 void draw(cairo_t *cr, struct surface_state *state) {
 	int w = state->width;
 	int h = state->height;
+	struct point size = {.x = w, .y = h};
 	// Draw background
 	cairo_rectangle(cr, 0, 0, w, h);
 	cairo_set_source_rgba(cr, 0, 0, 0, 0.8);
@@ -213,6 +247,7 @@ void draw(cairo_t *cr, struct surface_state *state) {
 	// Draw things
 	draw_entries(cr, core.root, (struct point){});
 	draw_selection(cr, core.selected_file);
+	draw_preview(cr, core.selected_file, size);
 }
 
 void draw_entries(cairo_t *cr, struct node *n, struct point offset) {

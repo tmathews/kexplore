@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 struct file_handler {
 	char **exts;
 	char *command;
@@ -11,6 +13,7 @@ char *string_concat(const char *, const char *);
 // later.
 char *string_path_join(const char *, const char *);
 
+bool is_file_ext(const char *filepath, const char *ext);
 int open_file(const char *filepath, const struct file_handler *);
 int run_cmd(const char *str);
 struct file_handler *read_handlers(const char *);
