@@ -4,13 +4,14 @@
 // TODO
 //  - upon open center camera on target node
 //  - have icons for directories
-//  - show a nice button for opening files (that are recognized)
+//  - show a nice button for opening files (that are recognized with handler)
 //  - node navigation buttons:
 //  	* jump to parent
 //  	* jump to home
 //  	* bookmark current url
 //  	* copy current url
 //  - keyboard navigation:
+//  	* q or esc to quit
 //  	* h/left, l/right for out of and into directory
 //  	* j/k/up/down for current node index traversal
 // 	- preview image pane with support for: svg, gif, jpeg, png, webp, etc.
@@ -59,12 +60,14 @@ struct fonts {
 
 struct core {
 	wl_fixed_t x, y, lx, ly;
+	float pan_speed;
 	struct point camera;
 	struct node *root;
 	struct hitbox *boxes;
 	char *selected_file;
 	struct ev_entry selection;
 	bool is_dragging;
+	bool first_draw;
 	struct fonts fonts;
 	struct file_handler *fhandlers;
 	cairo_surface_t *preview_surface;
@@ -87,6 +90,7 @@ int main(int argc, char *argv[]) {
 	core.y = 0;
 	core.camera.x = 0;
 	core.camera.y = 0;
+	core.pan_speed = 1.5;
 	core.boxes = NULL;
 	core.selected_file = NULL;
 	core.is_dragging = false;
@@ -109,6 +113,7 @@ int main(int argc, char *argv[]) {
 	}
 	app_init();
 	app.draw = &draw;
+	core.first_draw = true;
 	while (app_running()) {
 		app_process();
 		process();
@@ -128,9 +133,9 @@ void process() {
 		core.y += app.pointer.y - core.ly;
 		core.lx = app.pointer.x;
 		core.ly = app.pointer.y;
-		core.camera.x = -wl_fixed_to_int(core.x);
-		core.camera.y = -wl_fixed_to_int(core.y);
 	}
+	core.camera.x = -(wl_fixed_to_int(core.x)); // * core.pan_speed);
+	core.camera.y = -(wl_fixed_to_int(core.y)); // * core.pan_speed);
 	if (app.pointer.is_released) {
 		int x = core.camera.x + wl_fixed_to_int(app.pointer.x);
 		int y = core.camera.y + wl_fixed_to_int(app.pointer.y);
@@ -234,6 +239,12 @@ void draw(cairo_t *cr, struct surface_state *state) {
 	int w = state->width;
 	int h = state->height;
 	struct point size = {.x = w, .y = h};
+	if (core.first_draw) {
+		printf("First draw: %d %d\n", w, h);
+		core.x = wl_fixed_from_int(w * 0.5);
+		core.y = wl_fixed_from_int(h * 0.5);
+		core.first_draw = false;
+	}
 	// Draw background
 	cairo_rectangle(cr, 0, 0, w, h);
 	cairo_set_source_rgba(cr, 0, 0, 0, 0.8);
@@ -251,7 +262,7 @@ void draw(cairo_t *cr, struct surface_state *state) {
 }
 
 void draw_entries(cairo_t *cr, struct node *n, struct point offset) {
-	// TODO if display area is not on screen skip drawing
+	// TODO if display area is not on screen skip drawing!!!!
 	struct point origin, cursor;
 	origin.x = offset.x - core.camera.x;
 	origin.y = offset.y - core.camera.y;
