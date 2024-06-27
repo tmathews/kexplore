@@ -2,6 +2,10 @@
 
 #include <stdbool.h>
 
+struct fpoint {
+	double x, y;
+};
+
 struct point {
 	int x, y;
 };

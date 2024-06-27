@@ -10,32 +10,38 @@
 #include "stb_ds.h"
 #include "utils.h"
 
-char *string_concat(const char *a, const char *b) {
+char *string_concat(const char *a, const char *b)
+{
 	char *x = malloc(strlen(a) + strlen(b) + 1);
-	x[0] = 0;
+	x[0]    = 0;
 	strcpy(x, a);
 	strcat(x, b);
 	return x;
 }
 
-char *string_path_join(const char *a, const char *b) {
+char *string_path_join(const char *a, const char *b)
+{
 	char *npath = malloc(strlen(a) + strlen(b) + 2);
-	npath[0] = 0;
+	npath[0]    = 0;
 	strcpy(npath, a);
 	strcat(npath, "/");
 	strcat(npath, b);
 	return npath;
 }
 
-bool is_file_ext(const char *filepath, const char *ext) {
+bool is_file_ext(const char *filepath, const char *ext)
+{
 	char *b = strrchr(filepath, '.');
+	if (b == NULL)
+		return false;
 	if (strcasecmp(ext, b) == 0) {
 		return true;
 	}
 	return false;
 }
 
-int open_file(const char *filepath, const struct file_handler *handlers) {
+int open_file(const char *filepath, const struct file_handler *handlers)
+{
 	char *ext = strrchr(filepath, '.');
 	if (ext == NULL) {
 		return -1;
@@ -46,7 +52,7 @@ int open_file(const char *filepath, const struct file_handler *handlers) {
 	for (int i = 0; i < arrlen(handlers); i++) {
 		for (int n = 0; n < arrlen(handlers[i].exts); n++) {
 			if (strcasecmp(handlers[i].exts[n], ext) == 0) {
-				h = handlers[i];
+				h     = handlers[i];
 				found = true;
 				break;
 			}
@@ -61,7 +67,7 @@ int open_file(const char *filepath, const struct file_handler *handlers) {
 	char *pos = strstr(cmd, "{FILE}");
 	strcpy(pos, filepath);
 	char *epos = strstr(h.command, "{FILE}") + 6;
-	pos = cmd + strlen(cmd);
+	pos        = cmd + strlen(cmd);
 	strcpy(pos, epos);
 	// printf("cmd>>> %s\n", cmd);
 	int status = run_cmd(cmd);
@@ -69,7 +75,8 @@ int open_file(const char *filepath, const struct file_handler *handlers) {
 	return status;
 }
 
-int run_cmd(const char *str) {
+int run_cmd(const char *str)
+{
 	wordexp_t w;
 	switch (wordexp(str, &w, WRDE_NOCMD)) {
 	case 0:
@@ -100,7 +107,8 @@ int run_cmd(const char *str) {
 	return 0;
 }
 
-struct file_handler *read_handlers(const char *filename) {
+struct file_handler *read_handlers(const char *filename)
+{
 	printf("reading: %s\n", filename);
 	// ext, ...: command
 	FILE *fp;
@@ -111,11 +119,11 @@ struct file_handler *read_handlers(const char *filename) {
 	bool tick, tock = false;
 	char c;
 	char buf[4096];
-	buf[0] = '\0';
+	buf[0]                  = '\0';
 	struct file_handler *xs = NULL;
 	struct file_handler h;
 	h.command = NULL;
-	h.exts = NULL;
+	h.exts    = NULL;
 	while ((c = fgetc(fp)) && c != EOF) {
 		if (c == '\n') {
 			printf("buf: '%s'\n", buf);
@@ -123,7 +131,7 @@ struct file_handler *read_handlers(const char *filename) {
 			strcpy(h.command, buf);
 			arrput(xs, h);
 			h.command = NULL;
-			h.exts = NULL;
+			h.exts    = NULL;
 			memset(buf, 0, sizeof(buf));
 			tick = false;
 			tock = false;

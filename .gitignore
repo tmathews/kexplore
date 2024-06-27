@@ -1,2 +1,6 @@
 kexplore
+*.so
+*.o
+.cache
+compile_commands.json
 

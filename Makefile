@@ -1,12 +1,17 @@
-FLAGS = $(shell pkg-config --cflags --libs librsvg-2.0 pangocairo)
+FLAGS = $(shell pkg-config --cflags --libs librsvg-2.0 pangocairo libjpeg librsvg-2.0)
 FILES = $(shell find src -type f -iname *.c -o -iname *.h)
+VENDOR = $(shell find vendor -type f -iname *.o)
 
-build: protocol
-	echo $(FILES)
-	cc -g -o kexplore $(FILES) \
-		-lwayland-client -lwayland-cursor -lrt -lxkbcommon -lcairo -lm $(FLAGS)
+build:
+	cc -g -o kexplore $(FILES) $(VENDOR) \
+		-lwayland-client -lwayland-cursor -lrt -lxkbcommon -lcairo -lm $(FLAGS)\
+		-Ivendor/cairo_jpeg/src
 
-protocol:
+# TODO get better at make files or accept defeat and use CMake
+vendor:
+	cc -Wall -c vendor/cairo_jpeg/src/cairo_jpg.c -o vendor/cairo_jpeg/src/cairo_jpg.o `pkg-config cairo libjpeg --cflags --libs`
+
+wayland:
 	wayland-scanner private-code \
 		< /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml \
 		> src/klib/xdg-shell-protocol.c
@@ -24,8 +29,6 @@ clean:
 	rm -f src/klib/*-protocol.h src/klib/*-protocol.c kexplore
 
 install:
-	#mkdir -p /usr/local/share/kallos/
-	#cp -r data /usr/local/share/kallos/data
 	cp kexplore /usr/local/bin/
 
-.PHONY: build protocol clean install
+.PHONY: build wayland clean install vendor
