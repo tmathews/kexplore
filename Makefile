@@ -1,4 +1,4 @@
-FLAGS = $(shell pkg-config --cflags --libs librsvg-2.0 pangocairo libjpeg librsvg-2.0)
+FLAGS = $(shell pkg-config --cflags --libs librsvg-2.0 pangocairo libjpeg librsvg-2.0 libwebp)
 FILES = $(shell find src -type f -iname *.c -o -iname *.h)
 VENDOR = $(shell find vendor -type f -iname *.o)
 

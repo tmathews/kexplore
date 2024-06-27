@@ -31,9 +31,11 @@
 #include <pango/pangocairo.h>
 #include <pwd.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <wayland-util.h>
+#include <webp/decode.h>
 
 #include "app.h"
 #include "cairo_jpg.h"
@@ -402,6 +404,38 @@ void preview_destroy()
 	}
 }
 
+cairo_surface_t *cairo_image_surface_create_from_webp(const char *filename)
+{
+	void *data;
+	int infile;
+	struct stat stat;
+	if ((infile = open(filename, 0 | O_RDONLY)) == -1) {
+		return NULL;
+	}
+	if (fstat(infile, &stat) == -1) {
+		return NULL;
+	}
+	if ((data = malloc(stat.st_size)) == NULL) {
+		return NULL;
+	}
+	if (read(infile, data, stat.st_size) < stat.st_size) {
+		return NULL;
+	}
+	close(infile); // TODO clean this better
+	{
+		int w, h;
+		uint8_t *buf         = WebPDecodeBGRA(data, stat.st_size, &w, &h);
+		cairo_surface_t *sfc = cairo_image_surface_create_for_data(buf, CAIRO_FORMAT_ARGB32, w, h, w * 4);
+		if (cairo_surface_status(sfc) != CAIRO_STATUS_SUCCESS) {
+			return NULL;
+		}
+		cairo_surface_mark_dirty(sfc);
+		cairo_surface_set_mime_data(sfc, "image/webp", data, stat.st_size, WebPFree, data);
+		return sfc;
+	}
+	return NULL;
+}
+
 void preview_create()
 {
 	const char *filename = core.selected_file;
@@ -413,7 +447,9 @@ void preview_create()
 			rsvg_handle_set_dpi(h, 72.0);
 			core.preview_svg = h;
 		}
-	} else if (is_file_ext(filename, ".jpg") || is_file_ext(filename, ".jpeg")) {
+	} else if (is_file_ext(filename, ".jpg") || is_file_ext(filename, ".jpeg") || is_file_ext(filename, ".jfif")) {
 		core.preview_surface = cairo_image_surface_create_from_jpeg(filename);
+	} else if (is_file_ext(filename, ".webp")) {
+		core.preview_surface = cairo_image_surface_create_from_webp(filename);
 	}
 }
