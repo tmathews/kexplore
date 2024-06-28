@@ -2,6 +2,7 @@
 // collections of files. Freely explore your file system like it's a big map.
 //
 // TODO
+//  - load files in a separate thread
 //  - upon open center camera on target node
 //  - have icons for directories
 //  - show a nice button for opening files (that are recognized with handler)
@@ -83,7 +84,7 @@ void process();
 void preview_create();
 void preview_destroy();
 void draw(cairo_t *, struct surface_state *);
-void draw_entries(cairo_t *, struct node *, struct point);
+void draw_entries(cairo_t *, struct node *, struct point, struct rectangle);
 
 int main(int argc, char *argv[])
 {
@@ -294,53 +295,63 @@ void draw(cairo_t *cr, struct surface_state *state)
 	arrfree(core.boxes);
 	core.boxes = NULL;
 	// Draw things
-	draw_entries(cr, core.root, (struct point){});
+	struct rectangle cam;
+	cam.min = core.camera;
+	cam.max = point_add(core.camera, (struct point){.x = w, .y = h});
+	draw_entries(cr, core.root, (struct point){.x = 0, .y = 0}, cam);
 	draw_selection(cr, size);
 	draw_preview(cr, core.selected_file, size);
 }
 
-void draw_entries(cairo_t *cr, struct node *n, struct point offset)
+void draw_entries(cairo_t *cr, struct node *n, struct point offset, struct rectangle camera)
 {
-	// TODO if display area is not on screen skip drawing!!!!
-	struct point origin, cursor;
-	origin.x          = offset.x - core.camera.x;
-	origin.y          = offset.y - core.camera.y;
-	cursor.x          = origin.x + 5;
-	cursor.y          = origin.y;
-	struct point size = {
-		.x = 0,
-		.y = 0,
-	};
-	{
+	// Calculate the area if it's the first time we are encountering it.
+	if (rectangle_is_zero(&n->rect)) {
+		node_calc_size(n, cr, core.fonts.normal);
+		n->rect = rectangle_add_point(n->rect, offset);
+	}
+	// Draw our node if in camera
+	if (rectangle_intersects(&camera, &n->rect)) {
+		struct point render_offset;
+		render_offset.x = -camera.min.x;
+		render_offset.y = -camera.min.y;
+		// Draw the box
 		cairo_save(cr);
-		// draw contents
-		int len = arrlen(n->items);
+		// TODO if the path is outside the render camera, then squash it to just
+		// outside to save drawing. Find out if this is a micro optimization.
+		path_rounded_rect_ab(cr,
+			point_to_fpoint(point_add(n->rect.min, render_offset)),
+			point_to_fpoint(point_add(n->rect.max, render_offset)), 5);
 		cairo_set_source_rgb(cr, 1, 1, 1);
+		cairo_set_line_width(cr, 3);
+		cairo_stroke(cr);
+		cairo_restore(cr);
+		// Draw each item
+		cairo_save(cr);
+		int len = arrlen(n->items);
 		for (int i = 0; i < len; i++) {
 			struct node_item item = n->items[i];
-			bool selected         = core.selection.n == n && i == core.selection.i;
-			bool is_highlighted   = node_is_item(n->next, &item);
-			cursor.y += 5;
-			cairo_move_to(cr, cursor.x, cursor.y);
+			// Add our parent offset to get the global rect
+			struct rectangle rect = rectangle_add_point(item.rect, n->rect.min);
+			if (!rectangle_intersects(&camera, &rect)) {
+				continue;
+			}
+			bool selected       = core.selection.n == n && i == core.selection.i;
+			bool is_highlighted = node_is_item(n->next, &item);
 			if (is_highlighted) {
-				offset.y = cursor.y + core.camera.y;
+				offset.y = rect.min.y;
 			}
 			if (selected || is_highlighted) {
 				cairo_set_source_rgb(cr, 1, 0, 0);
 			} else {
 				cairo_set_source_rgb(cr, 1, 1, 1);
 			}
-			struct point tsize =
-				draw_text2(cr, core.fonts.normal, item.info.d_name);
-			if (tsize.x > size.x) {
-				size.x = tsize.x + 10;
-			}
-			{ // hit box
+			cairo_move_to(cr, rect.min.x + render_offset.x, rect.min.y + render_offset.y);
+			draw_text2(cr, core.fonts.normal, item.info.d_name);
+			{
+				// TODO make hitbox generation a method or something
 				struct hitbox hitbox;
-				hitbox.area.min.x  = cursor.x + core.camera.x;
-				hitbox.area.min.y  = cursor.y + core.camera.y;
-				hitbox.area.max.x  = cursor.x + tsize.x + core.camera.x;
-				hitbox.area.max.y  = cursor.y + tsize.y + core.camera.y;
+				hitbox.area        = rect;
 				hitbox.trigger     = 1;
 				struct ev_entry *e = calloc(1, sizeof(struct ev_entry));
 				e->n               = n;
@@ -351,10 +362,10 @@ void draw_entries(cairo_t *cr, struct node *n, struct point offset)
 			}
 			if (selected) { // open button
 				struct hitbox hitbox;
-				hitbox.area.min.x  = cursor.x + tsize.x + 10 + core.camera.x;
-				hitbox.area.min.y  = cursor.y + core.camera.y;
+				hitbox.area.min.x  = rect.max.x + 10;
+				hitbox.area.min.y  = rect.min.y;
 				hitbox.area.max.x  = hitbox.area.min.x + 20;
-				hitbox.area.max.y  = cursor.y + tsize.y + core.camera.y;
+				hitbox.area.max.y  = hitbox.area.min.y + 20;
 				hitbox.trigger     = 1;
 				struct ev_entry *e = calloc(1, sizeof(struct ev_entry));
 				e->n               = n;
@@ -365,31 +376,24 @@ void draw_entries(cairo_t *cr, struct node *n, struct point offset)
 				// draw button
 				struct point btnSize = rectangle_size(&hitbox.area);
 				path_rounded_rect(
-					cr, hitbox.area.min.x + .5 - core.camera.x,
-					hitbox.area.min.y + .5 - core.camera.y, btnSize.x,
-					btnSize.y, 5);
+					cr,
+					hitbox.area.min.x + .5 + render_offset.x,
+					hitbox.area.min.y + .5 + render_offset.y,
+					btnSize.x,
+					btnSize.y,
+					5);
 				cairo_set_source_rgb(cr, 1, 0, 1);
 				cairo_set_line_width(cr, 3);
 				cairo_stroke(cr);
 			}
-			cursor.y += tsize.y;
-			size.y += tsize.y + 5;
 		}
 		cairo_restore(cr);
 	}
-	// draw bounding box
-	path_rounded_rect(cr, origin.x + .5, origin.y + .5, size.x, size.y, 5);
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	cairo_set_line_width(cr, 3);
-	cairo_stroke(cr);
-
-	offset.x += size.x + 20;
 	if (n->next != NULL) {
-		draw_entries(cr, n->next, offset);
+		struct point size = rectangle_size(&n->rect);
+		offset.x += size.x + 20;
+		draw_entries(cr, n->next, offset, camera);
 	}
-	// for (int i = 0; i < arrlen(n->children); i++) {
-	//	draw_entries(cr, &n->children[i], offset);
-	// }
 }
 
 void preview_destroy()

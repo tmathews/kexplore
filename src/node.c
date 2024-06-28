@@ -1,4 +1,3 @@
-#include <cairo/cairo.h>
 #include <dirent.h>
 #include <pwd.h>
 #include <stdio.h>
@@ -7,18 +6,21 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "klib/draw.h"
 #include "klib/geometry.h"
 #include "node.h"
 #include "stb_ds.h"
 #include "utils.h"
 
-int node_item_sort(const void *a, const void *b) {
+int node_item_sort(const void *a, const void *b)
+{
 	struct node_item *aa = (struct node_item *)a;
 	struct node_item *bb = (struct node_item *)b;
 	return strcmp(aa->info.d_name, bb->info.d_name);
 }
 
-bool node_is_item(struct node *n, struct node_item *item) {
+bool node_is_item(struct node *n, struct node_item *item)
+{
 	if (n == NULL || item == NULL)
 		return false;
 	char *name = strrchr(n->filepath, '/');
@@ -26,7 +28,8 @@ bool node_is_item(struct node *n, struct node_item *item) {
 	return strcmp(name, item->info.d_name) == 0;
 }
 
-struct node *node_open(const char *filepath) {
+struct node *node_open(const char *filepath)
+{
 	DIR *dp;
 	struct dirent *ep;
 	dp = opendir(filepath);
@@ -34,15 +37,17 @@ struct node *node_open(const char *filepath) {
 		return NULL;
 	}
 	struct node *n = calloc(1, sizeof(struct node));
-	n->filepath = malloc(strlen(filepath) + 1);
+	n->filepath    = malloc(strlen(filepath) + 1);
+	n->rect        = rectangle_zero();
 	strcpy(n->filepath, filepath);
 	while ((ep = readdir(dp)) != NULL) {
 		if (strcmp(ep->d_name, ".") == 0 || strcmp(ep->d_name, "..") == 0) {
 			continue;
 		}
 		struct node_item item = {
-			.info = *ep,
+			.info     = *ep,
 			.selected = false,
+			.rect     = rectangle_zero(),
 		};
 		arrput(n->items, item);
 	}
@@ -51,7 +56,8 @@ struct node *node_open(const char *filepath) {
 	return n;
 }
 
-void node_close(struct node *n) {
+void node_close(struct node *n)
+{
 	if (n->next != NULL) {
 		node_close(n->next);
 	}
@@ -60,27 +66,40 @@ void node_close(struct node *n) {
 	free(n);
 }
 
-bool node_open_child(struct node *n, const char *name) {
+bool node_open_child(struct node *n, const char *name)
+{
 	if (n->next != NULL) {
 		node_close(n->next);
 	}
-	char *npath = string_path_join(n->filepath, name);
+	char *npath        = string_path_join(n->filepath, name);
 	struct node *child = node_open(npath);
 	free(npath);
 	if (child == NULL) {
 		return false;
 	}
 	child->parent = n;
-	n->next = child;
+	n->next       = child;
 	// TODO finish my implementation
 	return false;
 }
 
-struct point node_calc_size(struct node *n) {
-	// TODO this is just a dummy method, to replace
-	struct point p = {
-		.y = arrlen(n->items) * 24,
-		.x = 300,
-	};
-	return p;
+void node_calc_size(struct node *n, cairo_t *cr, PangoFontDescription *desc)
+{
+	const int padding     = 5;
+	int oy                = padding;
+	int mx                = 0;
+	struct rectangle rect = rectangle_from_abxy(0, 0, 0, 0);
+	for (int i = 0; i < arrlen(n->items); i++) {
+		struct point size = text_size(cr, desc, n->items[i].info.d_name);
+		n->items[i].rect  = rectangle_from_abxy(
+            padding, oy,
+            padding + size.x, oy + size.y);
+		oy += size.y;
+		if (size.x > mx) {
+			mx = size.x;
+		}
+	}
+	rect.max.x = mx + padding + padding;
+	rect.max.y = oy + padding;
+	n->rect    = rect;
 }
