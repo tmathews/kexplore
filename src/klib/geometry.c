@@ -62,9 +62,19 @@ bool rectangle_contains_point(const struct rectangle *r, const struct point *p)
 	return rectangle_contains(r, p->x, p->y);
 }
 
-bool rectangle_intersects(const struct rectangle *r, const struct rectangle *b)
+bool rectangle_intersects(const struct rectangle *a, const struct rectangle *b)
 {
-	return true; // TODO implement me!
+	// function intersectRect(r1, r2) {
+	//   return !(r2.left > r1.right ||
+	//     r2.right < r1.left ||
+	//     r2.top > r1.bottom ||
+	//     r2.bottom < r1.top);
+	// }
+	return (!(
+		b->min.x > a->max.x ||
+		b->max.x < a->min.x ||
+		b->min.y > a->max.y ||
+		b->max.y < a->min.y));
 }
 
 bool rectangle_is_zero(const struct rectangle *r)
