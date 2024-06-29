@@ -64,12 +64,6 @@ bool rectangle_contains_point(const struct rectangle *r, const struct point *p)
 
 bool rectangle_intersects(const struct rectangle *a, const struct rectangle *b)
 {
-	// function intersectRect(r1, r2) {
-	//   return !(r2.left > r1.right ||
-	//     r2.right < r1.left ||
-	//     r2.top > r1.bottom ||
-	//     r2.bottom < r1.top);
-	// }
 	return (!(
 		b->min.x > a->max.x ||
 		b->max.x < a->min.x ||

@@ -71,12 +71,13 @@ struct core {
 	struct hitbox *boxes;
 	char *selected_file;
 	struct ev_entry selection;
-	bool is_dragging;
 	bool first_draw;
 	struct fonts fonts;
 	struct file_handler *fhandlers;
 	cairo_surface_t *preview_surface;
 	RsvgHandle *preview_svg;
+	void *drag_target;
+	bool is_dragging;
 } core;
 
 struct app app;
@@ -84,7 +85,7 @@ void process();
 void preview_create();
 void preview_destroy();
 void draw(cairo_t *, struct surface_state *);
-void draw_entries(cairo_t *, struct node *, struct point, struct rectangle);
+void draw_entries(cairo_t *, struct node *, struct rectangle);
 
 int main(int argc, char *argv[])
 {
@@ -102,6 +103,7 @@ int main(int argc, char *argv[])
 	core.pan_speed      = 1.5;
 	core.boxes          = NULL;
 	core.selected_file  = NULL;
+	core.drag_target    = NULL;
 	core.is_dragging    = false;
 	struct passwd *info = getpwuid(getuid());
 	core.root           = node_open(info->pw_dir);
@@ -134,67 +136,94 @@ int main(int argc, char *argv[])
 
 void process()
 {
+	struct point cursor = {
+		.x = core.camera.x + wl_fixed_to_int(app.pointer.x),
+		.y = core.camera.y + wl_fixed_to_int(app.pointer.y),
+	};
+	struct ev_entry *e = NULL;
+	for (int i = arrlen(core.boxes) - 1; i >= 0; i--) {
+		struct hitbox box = core.boxes[i];
+		// printf(
+		//	"x: %d y: %d x2: %d y2: %d\n", box.area.min.x,
+		//	box.area.min.y, box.area.max.x, box.area.max.y
+		//);
+		if (rectangle_contains(&box.area, cursor.x, cursor.y)) {
+			e = box.userdata;
+			break;
+			// printf("hit: %d!\n", box.trigger);
+			//  printf(
+			//	"hit info: %s, index: %d, filename: %s\n",
+			//	e->n->filepath, e->i, e->n->items[e->i].info.d_name
+			//);
+		}
+	}
 	if (app.pointer.is_pressed) {
 		core.lx = app.pointer.x;
 		core.ly = app.pointer.y;
+		if (e != NULL) {
+			core.drag_target = e->n;
+		} else {
+			core.drag_target = NULL;
+		}
 	}
 	if (app.pointer.is_down) {
-		core.x += app.pointer.x - core.lx;
-		core.y += app.pointer.y - core.ly;
+		int x   = app.pointer.x - core.lx;
+		int y   = app.pointer.y - core.ly;
 		core.lx = app.pointer.x;
 		core.ly = app.pointer.y;
+		if (x != 0 || y != 0)
+			core.is_dragging = true;
+		if (core.drag_target == NULL) {
+			core.x += x;
+			core.y += y;
+		} else {
+			struct point pt = {
+				.x = wl_fixed_to_int(x),
+				.y = wl_fixed_to_int(y),
+			};
+			struct node *n = core.drag_target;
+			n->rect        = rectangle_add_point(n->rect, pt);
+		}
 	}
 	core.camera.x = -(wl_fixed_to_int(core.x)); // * core.pan_speed);
 	core.camera.y = -(wl_fixed_to_int(core.y)); // * core.pan_speed);
 	if (app.pointer.is_released) {
-		int x = core.camera.x + wl_fixed_to_int(app.pointer.x);
-		int y = core.camera.y + wl_fixed_to_int(app.pointer.y);
 		// printf("touch at %d %d\n", x, y);
-		if (!core.is_dragging) {
-			for (int i = 0; i < arrlen(core.boxes); i++) {
-				struct hitbox box = core.boxes[i];
-				// printf(
-				//	"x: %d y: %d x2: %d y2: %d\n", box.area.min.x,
-				//	box.area.min.y, box.area.max.x, box.area.max.y
-				//);
-				if (rectangle_contains(&box.area, x, y)) {
-					struct ev_entry *e = box.userdata;
-					// printf("hit: %d!\n", box.trigger);
-					//  printf(
-					//	"hit info: %s, index: %d, filename: %s\n",
-					//	e->n->filepath, e->i, e->n->items[e->i].info.d_name
-					//);
-					if (e->type == 1) {
-						// printf("hit button\n");
-						char *filepath = string_path_join(
-							e->n->filepath, e->n->items[e->i].info.d_name);
-						open_file(filepath, core.fhandlers);
-						free(filepath);
-					} else {
-						printf("hit selection\n");
-						core.selection = *e;
-						if (core.selected_file != NULL) {
-							free(core.selected_file);
-						}
-						core.selected_file = string_path_join(
-							e->n->filepath, e->n->items[e->i].info.d_name);
-						preview_destroy();
-						if (e->n->items[e->i].info.d_type == DT_DIR) {
-							printf("opening...\n");
-							node_open_child(
-								e->n, e->n->items[e->i].info.d_name);
-						} else {
-							if (e->n->next != NULL) {
-								node_close(e->n->next);
-								e->n->next = NULL;
-							}
-							preview_create();
-						}
-					}
-					break;
+		if (!core.is_dragging && e != NULL) {
+			switch (e->type) {
+			case 0: { // Hit a node item
+				// printf("hit selection\n");
+				core.selection = *e;
+				if (core.selected_file != NULL) {
+					free(core.selected_file);
 				}
+				core.selected_file = string_path_join(
+					e->n->filepath, e->n->items[e->i].info.d_name);
+				preview_destroy();
+				if (e->n->items[e->i].info.d_type == DT_DIR) {
+					printf("opening...\n");
+					node_open_child(
+						e->n, e->i);
+				} else {
+					preview_create();
+				}
+			} break;
+			case 1: { // Hit open button
+				// printf("hit button\n");
+				char *filepath = string_path_join(
+					e->n->filepath, e->n->items[e->i].info.d_name);
+				open_file(filepath, core.fhandlers);
+				free(filepath);
+			} break;
+			case 3: {
+				node_close(e->n);
+			} break;
+			default: // NOOP
+				break;
 			}
 		}
+		core.is_dragging = false;
+		core.drag_target = NULL;
 	}
 }
 
@@ -236,22 +265,22 @@ void draw_selection(cairo_t *cr, struct point surf_size)
 void draw_preview(cairo_t *cr, const char *filename, struct point window_size)
 {
 	int size = 400;
-	double x = 10;
-	double y, w, h = 0;
+	double x, y, w, h = 0;
 	double scale = 1;
 	cairo_save(cr);
 	if (core.preview_surface != NULL) {
 		w     = cairo_image_surface_get_width(core.preview_surface);
 		h     = cairo_image_surface_get_height(core.preview_surface);
 		scale = (float)size / (float)w;
+		x     = window_size.x - 10 - (w * scale);
 		y     = window_size.y - 10 - (h * scale);
 		cairo_translate(cr, x, y);
 		cairo_scale(cr, scale, scale);
 		cairo_set_source_surface(cr, core.preview_surface, 0, 0);
 		cairo_paint(cr);
 		cairo_restore(cr);
-
 	} else if (core.preview_svg != NULL) {
+		x                  = window_size.x - 10 - size;
 		y                  = window_size.y - 10 - size;
 		w                  = size;
 		h                  = size;
@@ -298,23 +327,22 @@ void draw(cairo_t *cr, struct surface_state *state)
 	struct rectangle cam;
 	cam.min = core.camera;
 	cam.max = point_add(core.camera, (struct point){.x = w, .y = h});
-	draw_entries(cr, core.root, (struct point){.x = 0, .y = 0}, cam);
-	draw_selection(cr, size);
+	draw_entries(cr, core.root, cam);
+	// draw_selection(cr, size);
 	draw_preview(cr, core.selected_file, size);
 }
 
-void draw_entries(cairo_t *cr, struct node *n, struct point offset, struct rectangle camera)
+void draw_entries(cairo_t *cr, struct node *n, struct rectangle camera)
 {
 	// Calculate the area if it's the first time we are encountering it.
 	if (rectangle_is_zero(&n->rect)) {
 		node_calc_size(n, cr, core.fonts.normal);
-		n->rect = rectangle_add_point(n->rect, offset);
 	}
+	struct point render_offset;
+	render_offset.x = -camera.min.x;
+	render_offset.y = -camera.min.y;
 	// Draw our node if in camera
 	if (rectangle_intersects(&camera, &n->rect)) {
-		struct point render_offset;
-		render_offset.x = -camera.min.x;
-		render_offset.y = -camera.min.y;
 		// Draw the box
 		cairo_save(cr);
 		// TODO if the path is outside the render camera, then squash it to just
@@ -322,27 +350,59 @@ void draw_entries(cairo_t *cr, struct node *n, struct point offset, struct recta
 		path_rounded_rect_ab(cr,
 			point_to_fpoint(point_add(n->rect.min, render_offset)),
 			point_to_fpoint(point_add(n->rect.max, render_offset)), 5);
+		cairo_set_source_rgba(cr, 0, 0, 0, 0.5);
+		cairo_fill_preserve(cr);
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		cairo_set_line_width(cr, 3);
 		cairo_stroke(cr);
 		cairo_restore(cr);
-		// Draw each item
-		cairo_save(cr);
-		int len = arrlen(n->items);
-		for (int i = 0; i < len; i++) {
-			struct node_item item = n->items[i];
-			// Add our parent offset to get the global rect
-			struct rectangle rect = rectangle_add_point(item.rect, n->rect.min);
-			if (!rectangle_intersects(&camera, &rect)) {
-				continue;
-			}
-			bool selected       = core.selection.n == n && i == core.selection.i;
-			bool is_highlighted = node_is_item(n->next, &item);
-			if (is_highlighted) {
-				offset.y = rect.min.y;
-			}
-			if (selected || is_highlighted) {
+		{
+			struct hitbox hitbox;
+			hitbox.area        = n->rect;
+			hitbox.trigger     = 1;
+			struct ev_entry *e = calloc(1, sizeof(struct ev_entry));
+			e->type            = 2;
+			e->n               = n;
+			hitbox.userdata    = e;
+			arrput(core.boxes, hitbox);
+		}
+		// Draw the close button
+		if (n->parent != NULL) {
+			struct hitbox hitbox;
+			hitbox.area.min    = point_add(n->rect.min, (struct point){.x = 0, .y = -30});
+			hitbox.area.max    = point_add(hitbox.area.min, (struct point){.x = 20, .y = 20});
+			hitbox.trigger     = 1;
+			struct ev_entry *e = calloc(1, sizeof(struct ev_entry));
+			e->n               = n;
+			e->type            = 3;
+			hitbox.userdata    = e;
+			arrput(core.boxes, hitbox);
+			// draw button
+			struct point btnSize = rectangle_size(&hitbox.area);
+			path_rounded_rect_ab(
+				cr,
+				point_to_fpoint(point_add(hitbox.area.min, render_offset)),
+				point_to_fpoint(point_add(hitbox.area.max, render_offset)),
+				5);
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			cairo_set_line_width(cr, 3);
+			cairo_stroke(cr);
+		}
+	}
+	// Draw each item
+	int len = arrlen(n->items);
+	for (int i = 0; i < len; i++) {
+		struct node_item item = n->items[i];
+		// Add our parent offset to get the global rect
+		struct rectangle rect = rectangle_add_point(item.rect, n->rect.min);
+		bool in_view          = rectangle_intersects(&camera, &rect);
+		bool selected         = core.selection.n == n && i == core.selection.i;
+		if (in_view) {
+			cairo_save(cr);
+			if (selected) {
 				cairo_set_source_rgb(cr, 1, 0, 0);
+			} else if (item.next != NULL) {
+				cairo_set_source_rgb(cr, 0, 1, 0);
 			} else {
 				cairo_set_source_rgb(cr, 1, 1, 1);
 			}
@@ -386,13 +446,22 @@ void draw_entries(cairo_t *cr, struct node *n, struct point offset, struct recta
 				cairo_set_line_width(cr, 3);
 				cairo_stroke(cr);
 			}
+			cairo_restore(cr);
 		}
-		cairo_restore(cr);
-	}
-	if (n->next != NULL) {
-		struct point size = rectangle_size(&n->rect);
-		offset.x += size.x + 20;
-		draw_entries(cr, n->next, offset, camera);
+		if (item.next != NULL) {
+			draw_entries(cr, item.next, camera);
+			cairo_save(cr);
+			cairo_set_source_rgb(cr, 1, 1, 1);
+			cairo_set_line_width(cr, 3);
+			cairo_move_to(cr,
+				n->rect.max.x + render_offset.x,
+				rect.min.y + ((rect.max.y - rect.min.y) / 2) + render_offset.y);
+			cairo_line_to(cr,
+				item.next->rect.min.x + render_offset.x,
+				item.next->rect.min.y + render_offset.y);
+			cairo_stroke(cr);
+			cairo_restore(cr);
+		}
 	}
 }
 

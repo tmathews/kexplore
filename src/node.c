@@ -45,9 +45,9 @@ struct node *node_open(const char *filepath)
 			continue;
 		}
 		struct node_item item = {
-			.info     = *ep,
-			.selected = false,
-			.rect     = rectangle_zero(),
+			.info = *ep,
+			.rect = rectangle_zero(),
+			.next = NULL,
 		};
 		arrput(n->items, item);
 	}
@@ -58,28 +58,37 @@ struct node *node_open(const char *filepath)
 
 void node_close(struct node *n)
 {
-	if (n->next != NULL) {
-		node_close(n->next);
+	int len;
+	// TODO this is hacky find a better way
+	if (n->parent != NULL) {
+		len = arrlen(n->parent->items);
+		for (int i = 0; i < len; i++) {
+			if (n->parent->items[i].next == n) {
+				n->parent->items[i].next = NULL;
+			}
+		}
+	}
+	len = arrlen(n->items);
+	for (int i = 0; i < len; i++) {
+		if (n->items[i].next != NULL) {
+			node_close(n->items[i].next);
+		}
 	}
 	arrfree(n->items);
 	free(n->filepath);
 	free(n);
 }
 
-bool node_open_child(struct node *n, const char *name)
+bool node_open_child(struct node *n, int index)
 {
-	if (n->next != NULL) {
-		node_close(n->next);
-	}
-	char *npath        = string_path_join(n->filepath, name);
+	char *npath        = string_path_join(n->filepath, n->items[index].info.d_name);
 	struct node *child = node_open(npath);
 	free(npath);
 	if (child == NULL) {
 		return false;
 	}
-	child->parent = n;
-	n->next       = child;
-	// TODO finish my implementation
+	child->parent        = n;
+	n->items[index].next = child;
 	return false;
 }
 
@@ -101,5 +110,19 @@ void node_calc_size(struct node *n, cairo_t *cr, PangoFontDescription *desc)
 	}
 	rect.max.x = mx + padding + padding;
 	rect.max.y = oy + padding;
-	n->rect    = rect;
+	// Set initial position based on parent
+	if (n->parent != NULL) {
+		struct node *p = n->parent;
+		struct point pt;
+		pt.x = p->rect.max.x + 20;
+		pt.y = p->rect.min.y;
+		for (int i = 0; i < arrlen(p->items); i++) {
+			if (p->items[i].next != n) {
+				continue;
+			}
+			pt.y += p->items[i].rect.min.y;
+		}
+		rect = rectangle_add_point(rect, pt);
+	}
+	n->rect = rect;
 }
