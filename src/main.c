@@ -308,9 +308,13 @@ void draw(cairo_t *cr, struct surface_state *state)
 	int h             = state->height;
 	struct point size = {.x = w, .y = h};
 	if (core.first_draw) {
+		node_calc_size(core.root, cr, core.fonts.normal);
+		struct point rsize = rectangle_size(&core.root->rect);
 		printf("First draw: %d %d\n", w, h);
-		core.x          = wl_fixed_from_int(w * 0.5);
-		core.y          = wl_fixed_from_int(h * 0.5);
+		printf("rsize: %d %d\n", rsize.x, rsize.y);
+		// TODO if too tall, then do top most point
+		core.x          = wl_fixed_from_int(w * 0.5) - wl_fixed_from_int(rsize.x * 0.5);
+		core.y          = wl_fixed_from_int(h * 0.5) - wl_fixed_from_int(rsize.y * 0.5);
 		core.first_draw = false;
 	}
 	// Draw background
