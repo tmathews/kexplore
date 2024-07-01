@@ -1,11 +1,44 @@
 #include "geometry.h"
 
-struct fpoint point_to_fpoint(struct point p)
+inline double double_lerp(double a, double b, double t)
 {
-	return (struct fpoint){
-		.x = p.x,
-		.y = p.y,
+	return a * (1.0 - t) + (b * t);
+}
+
+struct point point_zero()
+{
+	return (struct point){
+		.x = 0,
+		.y = 0,
 	};
+}
+
+bool point_is_zero(const struct point *pt)
+{
+	return (int)pt->x == 0 && (int)pt->y == 0; // TODO better precision
+}
+
+struct point point_lerp(const struct point *a, const struct point *b, double t)
+{
+	return (struct point){
+		.x = double_lerp(a->x, b->x, t),
+		.y = double_lerp(a->y, b->y, t),
+	};
+}
+
+bool point_equal(const struct point *a, const struct point *b)
+{
+	// TODO have better tolerance
+	int x = b->x - a->x;
+	int y = b->y - a->y;
+	return x == 0 && y == 0;
+}
+
+struct point point_sub(struct point a, struct point b)
+{
+	a.x -= b.x;
+	a.y -= b.y;
+	return a;
 }
 
 struct point point_add(struct point a, struct point b)
@@ -19,6 +52,11 @@ struct rectangle rectangle_zero()
 {
 	return rectangle_from_abxy(0, 0, 0, 0);
 }
+
+struct rectangle rectangle_from_abwh(int a, int b, int w, int h)
+{
+	return rectangle_from_abxy(a, b, a + w, b + h);
+};
 
 struct rectangle rectangle_from_abxy(int a, int b, int c, int d)
 {
@@ -73,7 +111,6 @@ bool rectangle_intersects(const struct rectangle *a, const struct rectangle *b)
 
 bool rectangle_is_zero(const struct rectangle *r)
 {
-	if (r->min.x == r->max.x && r->min.y == r->max.y)
-		return true;
-	return false;
+	struct point pt = point_sub(r->max, r->min);
+	return point_is_zero(&pt);
 }

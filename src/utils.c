@@ -126,7 +126,6 @@ struct file_handler *read_handlers(const char *filename)
 	h.exts    = NULL;
 	while ((c = fgetc(fp)) && c != EOF) {
 		if (c == '\n') {
-			printf("buf: '%s'\n", buf);
 			h.command = malloc(strlen(buf) + 1);
 			strcpy(h.command, buf);
 			arrput(xs, h);
@@ -141,7 +140,6 @@ struct file_handler *read_handlers(const char *filename)
 				break;
 			case ',':
 			case ':': {
-				printf("buf: '%s'\n", buf);
 				char *ext = calloc(1, strlen(buf) + 1);
 				strcpy(ext, buf);
 				arrput(h.exts, ext);

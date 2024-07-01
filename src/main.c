@@ -24,6 +24,7 @@
 // 	- bookmarks pane that allows you to jump to a directory quickly
 // 	- zoom?
 #define STB_DS_IMPLEMENTATION
+#include "stb_ds.h"
 
 #include <cairo/cairo.h>
 #include <dirent.h>
@@ -40,52 +41,23 @@
 
 #include "app.h"
 #include "cairo_jpg.h"
-#include "klib/draw.h"
 #include "klib/geometry.h"
-#include "klib/waywrap.h"
+#include "main.h"
 #include "node.h"
-#include "stb_ds.h"
 #include "utils.h"
 
-struct hitbox {
-	struct rectangle area;
-	int trigger;
-	void *userdata;
-};
-
-struct ev_entry {
-	struct node *n;
-	int i;
-	int type;
-};
-
-struct fonts {
-	PangoFontDescription *normal;
-};
-
-struct core {
-	wl_fixed_t x, y, lx, ly;
-	float pan_speed;
-	struct point camera;
-	struct node *root;
-	struct hitbox *boxes;
-	char *selected_file;
-	struct ev_entry selection;
-	bool first_draw;
-	struct fonts fonts;
-	struct file_handler *fhandlers;
-	cairo_surface_t *preview_surface;
-	RsvgHandle *preview_svg;
-	void *drag_target;
-	bool is_dragging;
-} core;
-
 struct app app;
-void process();
-void preview_create();
-void preview_destroy();
-void draw(cairo_t *, struct surface_state *);
-void draw_entries(cairo_t *, struct node *, struct rectangle);
+struct core core;
+
+RsvgHandle *load_svg(const char *filename)
+{
+	RsvgHandle *h = rsvg_handle_new_from_file(filename, NULL);
+	if (h == NULL) {
+		return NULL;
+	}
+	rsvg_handle_set_dpi(h, 72.0);
+	return h;
+}
 
 int main(int argc, char *argv[])
 {
@@ -96,10 +68,17 @@ int main(int argc, char *argv[])
 		pango_font_description_set_absolute_size(fd, 18 * PANGO_SCALE);
 		core.fonts.normal = fd;
 	}
-	core.x              = 0;
-	core.y              = 0;
-	core.camera.x       = 0;
-	core.camera.y       = 0;
+	{
+		core.icons.home      = load_svg("/usr/local/share/kallos/data/home.svg");
+		core.icons.close     = load_svg("/usr/local/share/kallos/data/close.svg");
+		core.icons.selection = load_svg("/usr/local/share/kallos/data/selection.svg");
+		core.icons.top       = load_svg("/usr/local/share/kallos/data/top.svg");
+		core.icons.parent    = load_svg("/usr/local/share/kallos/data/parent.svg");
+		core.icons.copy      = load_svg("/usr/local/share/kallos/data/copy.svg");
+		core.icons.open      = load_svg("/usr/local/share/kallos/data/open.svg");
+		core.icons.terminal  = load_svg("/usr/local/share/kallos/data/terminal.svg");
+	}
+	core.camera.min     = point_zero();
 	core.pan_speed      = 1.5;
 	core.boxes          = NULL;
 	core.selected_file  = NULL;
@@ -115,51 +94,42 @@ int main(int argc, char *argv[])
 		char *fname    = string_path_join(info->pw_dir, ".config/kallos/handlers");
 		core.fhandlers = read_handlers(fname);
 		free(fname);
-		// for (int i = 0; i < arrlen(core.fhandlers); i++) {
-		//	printf("new handler: '%s'!\n", core.fhandlers[i].command);
-		//	for (int n = 0; n < arrlen(core.fhandlers[i].exts); n++) {
-		//		printf("\t'%s'\n", core.fhandlers[i].exts[n]);
-		//	}
-		// }
 	}
 	app_init();
-	app.draw        = &draw;
-	core.first_draw = true;
+	app.draw = &draw;
 	while (app_running()) {
 		app_process();
 		process();
 	}
 	app_free();
 	pango_font_description_free(core.fonts.normal);
+	// TODO free icons
 	return 0;
 }
 
 void process()
 {
+	if (!point_equal(&core.camera_target, &core.camera.min) && core.camera_refocus) {
+		core.camera.min = point_lerp(&core.camera.min, &core.camera_target, 0.16);
+		if (point_equal(&core.camera_target, &core.camera.min)) {
+			core.camera_refocus = false;
+		}
+	}
 	struct point cursor = {
-		.x = core.camera.x + wl_fixed_to_int(app.pointer.x),
-		.y = core.camera.y + wl_fixed_to_int(app.pointer.y),
+		.x = core.camera.min.x + wl_fixed_to_double(app.pointer.x),
+		.y = core.camera.min.y + wl_fixed_to_double(app.pointer.y),
 	};
+	struct hitbox *hb  = NULL;
 	struct ev_entry *e = NULL;
 	for (int i = arrlen(core.boxes) - 1; i >= 0; i--) {
 		struct hitbox box = core.boxes[i];
-		// printf(
-		//	"x: %d y: %d x2: %d y2: %d\n", box.area.min.x,
-		//	box.area.min.y, box.area.max.x, box.area.max.y
-		//);
 		if (rectangle_contains(&box.area, cursor.x, cursor.y)) {
-			e = box.userdata;
+			hb = &box;
+			e  = box.userdata;
 			break;
-			// printf("hit: %d!\n", box.trigger);
-			//  printf(
-			//	"hit info: %s, index: %d, filename: %s\n",
-			//	e->n->filepath, e->i, e->n->items[e->i].info.d_name
-			//);
 		}
 	}
 	if (app.pointer.is_pressed) {
-		core.lx = app.pointer.x;
-		core.ly = app.pointer.y;
 		if (e != NULL) {
 			core.drag_target = e->n;
 		} else {
@@ -167,305 +137,99 @@ void process()
 		}
 	}
 	if (app.pointer.is_down) {
-		int x   = app.pointer.x - core.lx;
-		int y   = app.pointer.y - core.ly;
-		core.lx = app.pointer.x;
-		core.ly = app.pointer.y;
-		if (x != 0 || y != 0)
+		struct point pt_delta = {
+			.x = wl_fixed_to_double(app.pointer.x - core.lx),
+			.y = wl_fixed_to_double(app.pointer.y - core.ly),
+		};
+		if ((int)pt_delta.x != 0 || (int)pt_delta.y != 0) // TODO check pecision
 			core.is_dragging = true;
 		if (core.drag_target == NULL) {
-			core.x += x;
-			core.y += y;
+			core.camera.min = point_sub(core.camera.min, pt_delta);
 		} else {
-			struct point pt = {
-				.x = wl_fixed_to_int(x),
-				.y = wl_fixed_to_int(y),
-			};
 			struct node *n = core.drag_target;
-			n->rect        = rectangle_add_point(n->rect, pt);
+			n->rect        = rectangle_add_point(n->rect, pt_delta);
 		}
 	}
-	core.camera.x = -(wl_fixed_to_int(core.x)); // * core.pan_speed);
-	core.camera.y = -(wl_fixed_to_int(core.y)); // * core.pan_speed);
+	core.lx = app.pointer.x;
+	core.ly = app.pointer.y;
 	if (app.pointer.is_released) {
 		// printf("touch at %d %d\n", x, y);
-		if (!core.is_dragging && e != NULL) {
-			switch (e->type) {
-			case 0: { // Hit a node item
-				// printf("hit selection\n");
-				core.selection = *e;
+		if (!core.is_dragging && hb != NULL) {
+			switch (hb->trigger) {
+			case 7: {
 				if (core.selected_file != NULL) {
-					free(core.selected_file);
-				}
-				core.selected_file = string_path_join(
-					e->n->filepath, e->n->items[e->i].info.d_name);
-				preview_destroy();
-				if (e->n->items[e->i].info.d_type == DT_DIR) {
-					printf("opening...\n");
-					node_open_child(
-						e->n, e->i);
-				} else {
-					preview_create();
+					char *cmd = string_concat("foot -D ", core.selected_file);
+					run_cmd(cmd);
+					free(cmd);
 				}
 			} break;
-			case 1: { // Hit open button
-				// printf("hit button\n");
-				char *filepath = string_path_join(
-					e->n->filepath, e->n->items[e->i].info.d_name);
-				open_file(filepath, core.fhandlers);
-				free(filepath);
+			case 6: {
+				if (core.selected_file != NULL) {
+					char *cmd = string_concat("wl-copy ", core.selected_file);
+					run_cmd(cmd);
+					free(cmd);
+				}
 			} break;
-			case 3: {
-				node_close(e->n);
+			case 5: { // Go to top of current node
+				if (core.selection.n != NULL) {
+					focus_to_rect(&core.selection.n->rect, &core.camera);
+				}
 			} break;
-			default: // NOOP
-				break;
+			case 4: { // Focus current selection's parent
+				if (core.selection.n != NULL) {
+					struct node_pos npos = node_find_in_parent(core.selection.n);
+					struct rectangle r   = npos.item->rect;
+					r                    = rectangle_add_point(r, core.selection.n->rect.min);
+					focus_to_rect(&r, &core.camera);
+				}
+			} break;
+			case 3: { // Focus current selection
+				if (core.selection.n != NULL) {
+					struct rectangle r = core.selection.n->items[core.selection.i].rect;
+					r                  = rectangle_add_point(r, core.selection.n->rect.min);
+					focus_to_rect(&r, &core.camera);
+				}
+			} break;
+			case 2: { // Focus root
+				focus_to_rect(&core.root->rect, &core.camera);
+			} break;
+			case 1: { // Do other things lol
+				switch (e->type) {
+				case 0: { // Hit a node item
+					// printf("hit selection\n");
+					core.selection = *e;
+					if (core.selected_file != NULL) {
+						free(core.selected_file);
+					}
+					core.selected_file = string_path_join(
+						e->n->filepath, e->n->items[e->i].info.d_name);
+					preview_destroy();
+					if (e->n->items[e->i].info.d_type == DT_DIR) {
+						printf("opening...\n");
+						node_open_child(
+							e->n, e->i);
+					} else {
+						preview_create();
+					}
+				} break;
+				case 1: { // Hit open button
+					// printf("hit button\n");
+					char *filepath = string_path_join(
+						e->n->filepath, e->n->items[e->i].info.d_name);
+					open_file(filepath, core.fhandlers);
+					free(filepath);
+				} break;
+				case 3: {
+					node_close(e->n);
+				} break;
+				default: // NOOP
+					break;
+				}
+			} break;
 			}
 		}
 		core.is_dragging = false;
 		core.drag_target = NULL;
-	}
-}
-
-void draw_selection(cairo_t *cr, struct point surf_size)
-{
-	char *text = NULL;
-	if (core.selected_file == NULL) {
-		text = "No file selected";
-	} else {
-		text = core.selected_file;
-	}
-	const float padding  = 80;
-	struct point size    = text_size(cr, core.fonts.normal, text);
-	struct fpoint origin = {
-		.x = padding,
-		.y = 15,
-	};
-	struct fpoint extends = {
-		.x = surf_size.x - padding,
-		.y = origin.y + size.y + 10,
-	};
-	cairo_save(cr);
-	cairo_set_source_rgba(cr, 1, 1, 1, 0.1);
-	cairo_rectangle(cr, 0, 0, surf_size.x, extends.y + 15);
-	cairo_fill(cr);
-	cairo_restore(cr);
-	cairo_save(cr);
-	path_rounded_rect_ab(cr, origin, extends, 6);
-	cairo_set_source_rgba(cr, 1, 1, 1, 0.8);
-	cairo_fill_preserve(cr);
-	cairo_set_line_width(cr, 1);
-	cairo_stroke(cr);
-	cairo_move_to(cr, origin.x + 15, origin.y + ((extends.y - origin.y) / 2) - (int)(size.y / 2));
-	cairo_set_source_rgba(cr, 0, 0, 0, 1);
-	draw_text2(cr, core.fonts.normal, text);
-	cairo_restore(cr);
-}
-
-void draw_preview(cairo_t *cr, const char *filename, struct point window_size)
-{
-	int size = 400;
-	double x, y, w, h = 0;
-	double scale = 1;
-	cairo_save(cr);
-	if (core.preview_surface != NULL) {
-		w     = cairo_image_surface_get_width(core.preview_surface);
-		h     = cairo_image_surface_get_height(core.preview_surface);
-		scale = (float)size / (float)w;
-		x     = window_size.x - 10 - (w * scale);
-		y     = window_size.y - 10 - (h * scale);
-		cairo_translate(cr, x, y);
-		cairo_scale(cr, scale, scale);
-		cairo_set_source_surface(cr, core.preview_surface, 0, 0);
-		cairo_paint(cr);
-		cairo_restore(cr);
-	} else if (core.preview_svg != NULL) {
-		x                  = window_size.x - 10 - size;
-		y                  = window_size.y - 10 - size;
-		w                  = size;
-		h                  = size;
-		int padding        = 40;
-		RsvgRectangle rect = {
-			.x      = x + padding,
-			.y      = y + padding,
-			.width  = size - padding * 2,
-			.height = size - padding * 2,
-		};
-		cairo_set_source_rgba(cr, 1, 1, 1, 1);
-		rsvg_handle_render_document(core.preview_svg, cr, &rect, NULL);
-	}
-	cairo_save(cr);
-	cairo_rectangle(cr, x + .5, y + .5, w * scale, h * scale);
-	cairo_set_line_width(cr, 1);
-	cairo_set_source_rgba(cr, 1, 1, 1, 1);
-	cairo_stroke(cr);
-	cairo_restore(cr);
-}
-
-void draw(cairo_t *cr, struct surface_state *state)
-{
-	int w             = state->width;
-	int h             = state->height;
-	struct point size = {.x = w, .y = h};
-	if (core.first_draw) {
-		node_calc_size(core.root, cr, core.fonts.normal);
-		struct point rsize = rectangle_size(&core.root->rect);
-		printf("First draw: %d %d\n", w, h);
-		printf("rsize: %d %d\n", rsize.x, rsize.y);
-		// TODO if too tall, then do top most point
-		core.x          = wl_fixed_from_int(w * 0.5) - wl_fixed_from_int(rsize.x * 0.5);
-		core.y          = wl_fixed_from_int(h * 0.5) - wl_fixed_from_int(rsize.y * 0.5);
-		core.first_draw = false;
-	}
-	// Draw background
-	cairo_rectangle(cr, 0, 0, w, h);
-	cairo_set_source_rgba(cr, 0, 0, 0, 0.8);
-	cairo_fill(cr);
-	// Reset all our hit boxes
-	for (int i = 0; i < arrlen(core.boxes); i++) {
-		free(core.boxes[i].userdata);
-	}
-	arrfree(core.boxes);
-	core.boxes = NULL;
-	// Draw things
-	struct rectangle cam;
-	cam.min = core.camera;
-	cam.max = point_add(core.camera, (struct point){.x = w, .y = h});
-	draw_entries(cr, core.root, cam);
-	// draw_selection(cr, size);
-	draw_preview(cr, core.selected_file, size);
-}
-
-void draw_entries(cairo_t *cr, struct node *n, struct rectangle camera)
-{
-	// Calculate the area if it's the first time we are encountering it.
-	if (rectangle_is_zero(&n->rect)) {
-		node_calc_size(n, cr, core.fonts.normal);
-	}
-	struct point render_offset;
-	render_offset.x = -camera.min.x;
-	render_offset.y = -camera.min.y;
-	// Draw our node if in camera
-	if (rectangle_intersects(&camera, &n->rect)) {
-		// Draw the box
-		cairo_save(cr);
-		// TODO if the path is outside the render camera, then squash it to just
-		// outside to save drawing. Find out if this is a micro optimization.
-		path_rounded_rect_ab(cr,
-			point_to_fpoint(point_add(n->rect.min, render_offset)),
-			point_to_fpoint(point_add(n->rect.max, render_offset)), 5);
-		cairo_set_source_rgba(cr, 0, 0, 0, 0.5);
-		cairo_fill_preserve(cr);
-		cairo_set_source_rgb(cr, 1, 1, 1);
-		cairo_set_line_width(cr, 3);
-		cairo_stroke(cr);
-		cairo_restore(cr);
-		{
-			struct hitbox hitbox;
-			hitbox.area        = n->rect;
-			hitbox.trigger     = 1;
-			struct ev_entry *e = calloc(1, sizeof(struct ev_entry));
-			e->type            = 2;
-			e->n               = n;
-			hitbox.userdata    = e;
-			arrput(core.boxes, hitbox);
-		}
-		// Draw the close button
-		if (n->parent != NULL) {
-			struct hitbox hitbox;
-			hitbox.area.min    = point_add(n->rect.min, (struct point){.x = 0, .y = -30});
-			hitbox.area.max    = point_add(hitbox.area.min, (struct point){.x = 20, .y = 20});
-			hitbox.trigger     = 1;
-			struct ev_entry *e = calloc(1, sizeof(struct ev_entry));
-			e->n               = n;
-			e->type            = 3;
-			hitbox.userdata    = e;
-			arrput(core.boxes, hitbox);
-			// draw button
-			struct point btnSize = rectangle_size(&hitbox.area);
-			path_rounded_rect_ab(
-				cr,
-				point_to_fpoint(point_add(hitbox.area.min, render_offset)),
-				point_to_fpoint(point_add(hitbox.area.max, render_offset)),
-				5);
-			cairo_set_source_rgb(cr, 1, 1, 1);
-			cairo_set_line_width(cr, 3);
-			cairo_stroke(cr);
-		}
-	}
-	// Draw each item
-	int len = arrlen(n->items);
-	for (int i = 0; i < len; i++) {
-		struct node_item item = n->items[i];
-		// Add our parent offset to get the global rect
-		struct rectangle rect = rectangle_add_point(item.rect, n->rect.min);
-		bool in_view          = rectangle_intersects(&camera, &rect);
-		bool selected         = core.selection.n == n && i == core.selection.i;
-		if (in_view) {
-			cairo_save(cr);
-			if (selected) {
-				cairo_set_source_rgb(cr, 1, 0, 0);
-			} else if (item.next != NULL) {
-				cairo_set_source_rgb(cr, 0, 1, 0);
-			} else {
-				cairo_set_source_rgb(cr, 1, 1, 1);
-			}
-			cairo_move_to(cr, rect.min.x + render_offset.x, rect.min.y + render_offset.y);
-			draw_text2(cr, core.fonts.normal, item.info.d_name);
-			{
-				// TODO make hitbox generation a method or something
-				struct hitbox hitbox;
-				hitbox.area        = rect;
-				hitbox.trigger     = 1;
-				struct ev_entry *e = calloc(1, sizeof(struct ev_entry));
-				e->n               = n;
-				e->i               = i;
-				e->type            = 0;
-				hitbox.userdata    = e;
-				arrput(core.boxes, hitbox);
-			}
-			if (selected) { // open button
-				struct hitbox hitbox;
-				hitbox.area.min.x  = rect.max.x + 10;
-				hitbox.area.min.y  = rect.min.y;
-				hitbox.area.max.x  = hitbox.area.min.x + 20;
-				hitbox.area.max.y  = hitbox.area.min.y + 20;
-				hitbox.trigger     = 1;
-				struct ev_entry *e = calloc(1, sizeof(struct ev_entry));
-				e->n               = n;
-				e->i               = i;
-				e->type            = 1;
-				hitbox.userdata    = e;
-				arrput(core.boxes, hitbox);
-				// draw button
-				struct point btnSize = rectangle_size(&hitbox.area);
-				path_rounded_rect(
-					cr,
-					hitbox.area.min.x + .5 + render_offset.x,
-					hitbox.area.min.y + .5 + render_offset.y,
-					btnSize.x,
-					btnSize.y,
-					5);
-				cairo_set_source_rgb(cr, 1, 0, 1);
-				cairo_set_line_width(cr, 3);
-				cairo_stroke(cr);
-			}
-			cairo_restore(cr);
-		}
-		if (item.next != NULL) {
-			draw_entries(cr, item.next, camera);
-			cairo_save(cr);
-			cairo_set_source_rgb(cr, 1, 1, 1);
-			cairo_set_line_width(cr, 3);
-			cairo_move_to(cr,
-				n->rect.max.x + render_offset.x,
-				rect.min.y + ((rect.max.y - rect.min.y) / 2) + render_offset.y);
-			cairo_line_to(cr,
-				item.next->rect.min.x + render_offset.x,
-				item.next->rect.min.y + render_offset.y);
-			cairo_stroke(cr);
-			cairo_restore(cr);
-		}
 	}
 }
 

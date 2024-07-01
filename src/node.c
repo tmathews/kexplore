@@ -92,6 +92,23 @@ bool node_open_child(struct node *n, int index)
 	return false;
 }
 
+struct node_pos node_find_in_parent(const struct node *n)
+{
+	if (n->parent != NULL) {
+		struct node *p = n->parent;
+		struct point pt;
+		pt.x = p->rect.max.x + 20;
+		pt.y = p->rect.min.y;
+		for (int i = 0; i < arrlen(p->items); i++) {
+			if (p->items[i].next != n) {
+				continue;
+			}
+			return (struct node_pos){.item = &p->items[i], .index = i};
+		}
+	}
+	return (struct node_pos){.item = NULL, .index = -1};
+}
+
 void node_calc_size(struct node *n, cairo_t *cr, PangoFontDescription *desc)
 {
 	const int padding     = 5;
@@ -108,20 +125,15 @@ void node_calc_size(struct node *n, cairo_t *cr, PangoFontDescription *desc)
 			mx = size.x;
 		}
 	}
-	rect.max.x = mx + padding + padding;
-	rect.max.y = oy + padding;
+	rect.max.x           = mx + padding + padding;
+	rect.max.y           = oy + padding;
 	// Set initial position based on parent
-	if (n->parent != NULL) {
-		struct node *p = n->parent;
+	struct node_pos npos = node_find_in_parent(n);
+	if (npos.item != NULL) {
 		struct point pt;
-		pt.x = p->rect.max.x + 20;
-		pt.y = p->rect.min.y;
-		for (int i = 0; i < arrlen(p->items); i++) {
-			if (p->items[i].next != n) {
-				continue;
-			}
-			pt.y += p->items[i].rect.min.y;
-		}
+		pt.x = n->parent->rect.max.x + 20;
+		pt.y = n->parent->rect.min.y;
+		pt.y += npos.item->rect.min.y;
 		rect = rectangle_add_point(rect, pt);
 	}
 	n->rect = rect;

@@ -29,6 +29,8 @@ clean:
 	rm -f src/klib/*-protocol.h src/klib/*-protocol.c kexplore
 
 install:
+	mkdir -p /usr/local/share/kallos/data
+	cp -r data/* /usr/local/share/kallos/data/
 	cp kexplore /usr/local/bin/
 
 .PHONY: build wayland clean install vendor

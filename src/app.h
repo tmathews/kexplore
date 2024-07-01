@@ -14,12 +14,18 @@ struct pointer {
 	uint32_t last_time;
 };
 
+struct draw_context {
+	struct surface_state *surface_state;
+	cairo_t *cr;
+	cairo_surface_t *cr_surface;
+};
+
 struct app {
 	struct client_state *state;
 	struct surface_state *surf_state;
 	struct keyhold *keyhold_root;
 	struct pointer pointer;
-	void (*draw)(cairo_t *, struct surface_state *);
+	void (*draw)(struct draw_context);
 };
 
 void app_init();

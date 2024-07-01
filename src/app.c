@@ -33,15 +33,20 @@ void app_free()
 
 void app_on_draw(struct surface_state *state, unsigned char *data)
 {
-	cairo_surface_t *csurf = cairo_image_surface_create_for_data(
+	cairo_surface_t *surf = cairo_image_surface_create_for_data(
 		data, CAIRO_FORMAT_ARGB32, state->width, state->height, state->width * 4);
-	cairo_t *cr = cairo_create(csurf);
+	cairo_t *cr = cairo_create(surf);
 	if (app.draw != NULL) {
-		app.draw(cr, state);
+		struct draw_context ctx = {
+			.surface_state = state,
+			.cr_surface    = surf,
+			.cr            = cr,
+		};
+		app.draw(ctx);
 	}
-	cairo_surface_flush(csurf);
+	cairo_surface_flush(surf);
 	cairo_destroy(cr);
-	cairo_surface_destroy(csurf);
+	cairo_surface_destroy(surf);
 }
 
 void app_on_keyrepeat(xkb_keysym_t sym)
@@ -70,10 +75,9 @@ void app_process_pointer()
 {
 	app.pointer.is_released = false;
 	app.pointer.is_pressed  = false;
-	if (app.state->active_surface_pointer == NULL)
+	if (app.state->active_surface_pointer == NULL || app.state->active_surface_pointer->pointer == NULL) {
 		return;
-	if (app.state->active_surface_pointer->pointer == NULL)
-		return;
+	}
 	struct pointer_event *pe                   = app.state->active_surface_pointer->pointer;
 	app.state->active_surface_pointer->pointer = NULL;
 	for (; pe != NULL; pe = pe->next) {
