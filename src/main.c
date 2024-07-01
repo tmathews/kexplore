@@ -48,6 +48,7 @@
 
 struct app app;
 struct core core;
+double icon_rotation = 0;
 
 RsvgHandle *load_svg(const char *filename)
 {
@@ -77,6 +78,7 @@ int main(int argc, char *argv[])
 		core.icons.copy      = load_svg("/usr/local/share/kallos/data/copy.svg");
 		core.icons.open      = load_svg("/usr/local/share/kallos/data/open.svg");
 		core.icons.terminal  = load_svg("/usr/local/share/kallos/data/terminal.svg");
+		core.icons.busy      = load_svg("/usr/local/share/kallos/data/busy.svg");
 	}
 	core.camera.min     = point_zero();
 	core.pan_speed      = 1.5;
@@ -100,6 +102,7 @@ int main(int argc, char *argv[])
 	while (app_running()) {
 		app_process();
 		process();
+		icon_rotation += 0.2;
 	}
 	app_free();
 	pango_font_description_free(core.fonts.normal);
@@ -205,11 +208,13 @@ void process()
 						e->n->filepath, e->n->items[e->i].info.d_name);
 					preview_destroy();
 					if (e->n->items[e->i].info.d_type == DT_DIR) {
-						printf("opening...\n");
-						node_open_child(
-							e->n, e->i);
+						pthread_t tid;
+						pthread_create(&tid, NULL, &threaded_open_child_node, e);
 					} else {
-						preview_create();
+						// TODO do proper threading this is kinda fire and forget
+						// resolve by marking busy or kill current and run new
+						pthread_t tid;
+						pthread_create(&tid, NULL, &preview_create, NULL);
 					}
 				} break;
 				case 1: { // Hit open button
@@ -231,6 +236,13 @@ void process()
 		core.is_dragging = false;
 		core.drag_target = NULL;
 	}
+}
+
+void *threaded_open_child_node(void *userdata)
+{
+	struct ev_entry *e = userdata;
+	node_open_child(e->n, e->i);
+	return NULL;
 }
 
 void preview_destroy()
@@ -277,7 +289,7 @@ cairo_surface_t *cairo_image_surface_create_from_webp(const char *filename)
 	return NULL;
 }
 
-void preview_create()
+void *preview_create()
 {
 	const char *filename = core.selected_file;
 	if (is_file_ext(filename, ".png")) {
@@ -293,4 +305,5 @@ void preview_create()
 	} else if (is_file_ext(filename, ".webp")) {
 		core.preview_surface = cairo_image_surface_create_from_webp(filename);
 	}
+	return NULL;
 }

@@ -39,6 +39,7 @@ struct node *node_open(const char *filepath)
 	struct node *n = calloc(1, sizeof(struct node));
 	n->filepath    = malloc(strlen(filepath) + 1);
 	n->rect        = rectangle_zero();
+	n->busy        = true;
 	strcpy(n->filepath, filepath);
 	while ((ep = readdir(dp)) != NULL) {
 		if (strcmp(ep->d_name, ".") == 0 || strcmp(ep->d_name, "..") == 0) {
@@ -53,6 +54,7 @@ struct node *node_open(const char *filepath)
 	}
 	closedir(dp);
 	qsort(n->items, arrlen(n->items), sizeof(struct node_item), node_item_sort);
+	n->busy = false;
 	return n;
 }
 
@@ -81,6 +83,9 @@ void node_close(struct node *n)
 
 bool node_open_child(struct node *n, int index)
 {
+	if (n->items[index].next != NULL) {
+		return false;
+	}
 	char *npath        = string_path_join(n->filepath, n->items[index].info.d_name);
 	struct node *child = node_open(npath);
 	free(npath);
@@ -89,7 +94,7 @@ bool node_open_child(struct node *n, int index)
 	}
 	child->parent        = n;
 	n->items[index].next = child;
-	return false;
+	return true;
 }
 
 struct node_pos node_find_in_parent(const struct node *n)
@@ -111,6 +116,8 @@ struct node_pos node_find_in_parent(const struct node *n)
 
 void node_calc_size(struct node *n, cairo_t *cr, PangoFontDescription *desc)
 {
+	if (n->busy)
+		return;
 	const int padding     = 5;
 	int oy                = padding;
 	int mx                = 0;

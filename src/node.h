@@ -22,9 +22,8 @@ struct node {
 	char *filepath;
 	struct node_item *items;
 	struct node *parent;
-	// struct node *next; // next is the next open node
-	bool open;
 	struct rectangle rect;
+	bool busy;
 };
 
 bool node_is_item(struct node *n, struct node_item *item);

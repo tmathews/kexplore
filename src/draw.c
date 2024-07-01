@@ -8,6 +8,8 @@
 
 extern struct core core;
 
+extern double icon_rotation;
+
 void draw_svg(cairo_t *cr, RsvgHandle *h, const struct rectangle *r)
 {
 	struct point size  = rectangle_size(r);
@@ -296,26 +298,37 @@ void draw_entries(cairo_t *cr, struct node *n, struct rectangle camera)
 				hitbox.userdata    = e;
 				arrput(core.boxes, hitbox);
 				// draw button
-				struct rectangle rect = hitbox.area;
-				rect.min              = point_add(rect.min, render_offset);
-				rect.max              = point_add(rect.max, render_offset);
-				draw_svg_colored(cr, core.icons.open, &rect, 1, 1, 1, 1);
+				struct rectangle svgrect = hitbox.area;
+				svgrect.min              = point_add(svgrect.min, render_offset);
+				svgrect.max              = point_add(svgrect.max, render_offset);
+				draw_svg_colored(cr, core.icons.open, &svgrect, 1, 1, 1, 1);
 			}
 			cairo_restore(cr);
 		}
 		if (item.next != NULL) {
-			draw_entries(cr, item.next, camera);
-			cairo_save(cr);
-			cairo_set_source_rgb(cr, 1, 1, 1);
-			cairo_set_line_width(cr, 3);
-			cairo_move_to(cr,
-				n->rect.max.x + render_offset.x,
-				rect.min.y + ((rect.max.y - rect.min.y) / 2) + render_offset.y);
-			cairo_line_to(cr,
-				item.next->rect.min.x + render_offset.x,
-				item.next->rect.min.y + render_offset.y + 5);
-			cairo_stroke(cr);
-			cairo_restore(cr);
+			if (item.next->busy) {
+				cairo_save(cr);
+				struct rectangle rrect = rectangle_from_abwh(-8, -8, 16, 16);
+				struct rectangle nrect = rectangle_from_abwh(rect.max.x + 10, rect.min.y, 16, 16);
+				nrect                  = rectangle_add_point(rect, render_offset);
+				cairo_translate(cr, nrect.max.x + 16, nrect.min.y + 16);
+				cairo_rotate(cr, icon_rotation);
+				draw_svg_colored(cr, core.icons.busy, &rrect, 1, 1, 1, 1);
+				cairo_restore(cr);
+			} else {
+				draw_entries(cr, item.next, camera);
+				cairo_save(cr);
+				cairo_set_source_rgb(cr, 1, 1, 1);
+				cairo_set_line_width(cr, 3);
+				cairo_move_to(cr,
+					n->rect.max.x + render_offset.x,
+					rect.min.y + ((rect.max.y - rect.min.y) / 2) + render_offset.y);
+				cairo_line_to(cr,
+					item.next->rect.min.x + render_offset.x,
+					item.next->rect.min.y + render_offset.y + 5);
+				cairo_stroke(cr);
+				cairo_restore(cr);
+			}
 		}
 	}
 }

@@ -33,6 +33,7 @@ struct icons {
 	RsvgHandle *copy;
 	RsvgHandle *open;
 	RsvgHandle *terminal;
+	RsvgHandle *busy;
 };
 
 struct core {
@@ -55,8 +56,9 @@ struct core {
 };
 
 void process();
-void preview_create();
+void *preview_create();
 void preview_destroy();
+void *threaded_open_child_node(void *);
 void draw(struct draw_context);
 void draw_entries(cairo_t *, struct node *, struct rectangle);
 void draw_entries(cairo_t *cr, struct node *n, struct rectangle camera);
