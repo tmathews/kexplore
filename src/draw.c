@@ -30,6 +30,7 @@ void draw_svg_colored(cairo_t *cr, RsvgHandle *h, const struct rectangle *rect, 
 	cairo_mask(cr, pat);
 	cairo_fill(cr);
 	cairo_restore(cr);
+	cairo_pattern_destroy(pat);
 }
 
 void draw(struct draw_context ctx)
@@ -62,7 +63,7 @@ void draw_navigation(cairo_t *cr, struct rectangle camera)
 	struct point csize = rectangle_size(&camera);
 	{ // Draw background bar
 		cairo_save(cr);
-		cairo_set_source_rgba(cr, 0, 0, 0, 0.5);
+		cairo_set_source_rgba(cr, 0, 0, 0, .9);
 		cairo_rectangle(cr, 0, 0, csize.x, 62);
 		cairo_fill(cr);
 		cairo_restore(cr);
