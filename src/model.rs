@@ -191,8 +191,11 @@ pub fn calc_size(arena: &mut NodeArena, id: NodeId, ts: &mut TextSystem, max_siz
             let parent = arena.get(pid);
             match parent {
                 Some(p) => {
+                    // The item's row y is content-relative; subtract the
+                    // parent's scroll so the child spawns beside the row as
+                    // displayed, not where it would sit unscrolled.
                     let item_y = p.items.get(pidx).map(|it| it.rect.min.y).unwrap_or(0.0);
-                    Point::new(p.rect.max.x + 20.0, p.rect.min.y + item_y)
+                    Point::new(p.rect.max.x + 20.0, p.rect.min.y + item_y - p.scroll)
                 }
                 None => Point::ZERO,
             }
