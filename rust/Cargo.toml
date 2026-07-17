@@ -1,0 +1,15 @@
+[package]
+name = "kexplore"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ash = "0.38"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
+wayland-cursor = "0.31"
+fontdue = "0.9"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+libc = "0.2"
+bytemuck = { version = "1", features = ["derive"] }

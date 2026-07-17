@@ -1,0 +1,488 @@
+mod geom;
+mod gfx;
+mod handlers;
+mod model;
+mod platform;
+mod preview;
+mod tasks;
+mod text;
+mod ui;
+
+use std::ffi::OsStr;
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
+use std::time::Instant;
+
+use ash::vk;
+use geom::Point;
+use gfx::renderer2d::{DrawList, Renderer2d};
+use gfx::upload::{self, PendingUpload, Texture};
+use model::{NodeArena, NodeId};
+use preview::Preview;
+use tasks::{TaskResult, Tasks};
+use text::TextSystem;
+use ui::{Action, Ui};
+use wayland_client::Proxy;
+
+/// The current preview texture plus textures waiting out their last
+/// possibly-in-flight frames before destruction.
+struct PreviewTex {
+    current: Option<(Texture, vk::DescriptorSet, (u32, u32))>,
+    retired: Vec<(u64, Texture, vk::DescriptorSet)>,
+}
+
+impl PreviewTex {
+    fn retire_current(&mut self, frame_counter: u64) {
+        if let Some((tex, set, _)) = self.current.take() {
+            self.retired.push((frame_counter, tex, set));
+        }
+    }
+
+    fn destroy_old(&mut self, device: &ash::Device, renderer: &Renderer2d, frame_counter: u64) {
+        self.retired.retain(|(at, tex, set)| {
+            if frame_counter.saturating_sub(*at) > gfx::FRAMES_IN_FLIGHT as u64 {
+                unsafe { upload::destroy_texture(device, tex) };
+                renderer.free_texture_set(device, *set);
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+fn main() {
+    let platform::wayland::Init { conn, mut queue, mut platform } =
+        platform::wayland::init("Kallos Explore", "kallos-explore", (600, 440))
+            .unwrap_or_else(|e| {
+                eprintln!("failed to init wayland: {e}");
+                std::process::exit(1);
+            });
+
+    let display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
+    let surface_ptr = platform.surface.id().as_ptr() as *mut std::ffi::c_void;
+    let mut gfx = gfx::Gfx::new(display_ptr, surface_ptr, platform.physical_extent())
+        .unwrap_or_else(|e| {
+            eprintln!("failed to init vulkan: {e}");
+            std::process::exit(1);
+        });
+    let mut renderer = Renderer2d::new(&gfx.device, gfx.mem_props, gfx.swapchain.format)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to init renderer: {e}");
+            std::process::exit(1);
+        });
+    let mut ts = TextSystem::new(&gfx.device, &gfx.mem_props, platform.scale() as f32)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to init text system: {e}");
+            std::process::exit(1);
+        });
+    let atlas_set = renderer.register_texture(&gfx.device, &ts.texture).expect("atlas set");
+
+    // Root node: the user's home directory, like the C app.
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    let file_handlers = handlers::read_handlers(&home.join(".config/kallos/handlers"));
+    let mut children: Vec<std::process::Child> = Vec::new();
+    let mut arena = NodeArena::new();
+    let root_items = model::scan_dir(&home).unwrap_or_else(|e| {
+        eprintln!("failed to load node: {e}");
+        std::process::exit(1);
+    });
+    let root = arena.insert(model::node_from_items(home, root_items));
+    model::calc_size(&mut arena, root, &mut ts);
+
+    let mut ui = Ui::new();
+    if let Some(node) = arena.get(root) {
+        let r = node.rect;
+        ui.focus_to_rect(r, Point::new(600.0, 440.0));
+    }
+
+    let tasks = Tasks::new().unwrap_or_else(|e| {
+        eprintln!("failed to init task system: {e}");
+        std::process::exit(1);
+    });
+    let preview = Preview::new(&tasks);
+    let mut ptex = PreviewTex { current: None, retired: Vec::new() };
+    let mut extra_uploads: Vec<PendingUpload> = Vec::new();
+    let mut frame_counter: u64 = 0;
+
+    let start = Instant::now();
+    let mut last_frame = Instant::now();
+    let mut dirty = true;
+    let mut animating = true;
+
+    while platform.running {
+        queue.flush().ok();
+        queue.dispatch_pending(&mut platform).expect("wayland dispatch");
+        if let Some(guard) = queue.prepare_read() {
+            let wl_fd = guard.connection_fd().as_raw_fd();
+            let timeout: i32 = if dirty || animating {
+                0
+            } else if children.is_empty() {
+                -1
+            } else {
+                2000 // wake periodically to reap spawned children
+            };
+            let mut fds = [
+                libc::pollfd { fd: wl_fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: tasks.wake_read, events: libc::POLLIN, revents: 0 },
+            ];
+            let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as u64, timeout) };
+            if ret > 0 && fds[0].revents & libc::POLLIN != 0 {
+                guard.read().ok();
+            } else {
+                drop(guard);
+            }
+            queue.dispatch_pending(&mut platform).expect("wayland dispatch");
+        }
+        if !platform.running {
+            break;
+        }
+
+        handlers::reap(&mut children);
+        tasks.drain_wake();
+        while let Ok(result) = tasks.rx.try_recv() {
+            match result {
+                TaskResult::PreviewDone { gen, image } => {
+                    // Stale generations are dropped: the shown preview always
+                    // matches the latest selection.
+                    if gen == preview.current_gen() {
+                        ptex.retire_current(frame_counter);
+                        if let Some(img) = image {
+                            match make_preview_texture(&gfx, &renderer, &img) {
+                                Ok((tex, set)) => {
+                                    extra_uploads.push(PendingUpload {
+                                        texture_image: tex.image,
+                                        bytes: img.rgba,
+                                        x: 0,
+                                        y: 0,
+                                        width: img.width,
+                                        height: img.height,
+                                        initialized: false,
+                                    });
+                                    ptex.current = Some((tex, set, (img.width, img.height)));
+                                }
+                                Err(e) => eprintln!("preview texture failed: {e}"),
+                            }
+                        }
+                    }
+                }
+                other => apply_task_result(other, &mut arena, &mut ui, &mut ts, &platform),
+            }
+            dirty = true;
+        }
+
+        if platform.resized || platform.scale_changed {
+            platform.resized = false;
+            platform.scale_changed = false;
+            platform.apply_scale();
+            ts.set_scale(platform.scale() as f32);
+            if let Err(e) = gfx.recreate_swapchain(platform.physical_extent()) {
+                eprintln!("swapchain recreate failed: {e}");
+                break;
+            }
+            dirty = true;
+        }
+
+        let (lw, lh) = platform.logical_size;
+        let window = Point::new(lw as f32, lh as f32);
+
+        let (action, input_dirty) = ui.process_input(&mut arena, &platform.pointer_state);
+        dirty |= input_dirty;
+        platform.end_input_frame();
+        if let Some(action) = action {
+            let clear_preview = handle_action(
+                action,
+                &mut arena,
+                &mut ui,
+                &tasks,
+                &preview,
+                &file_handlers,
+                &mut children,
+                root,
+                window,
+            );
+            if clear_preview {
+                ptex.retire_current(frame_counter);
+            }
+            dirty = true;
+        }
+
+        let now = Instant::now();
+        let dt = (now - last_frame).as_secs_f32().min(0.1);
+        last_frame = now;
+        if ui.step_camera(dt) {
+            dirty = true;
+        }
+
+        if dirty || animating {
+            let scale = platform.scale() as f32;
+            let mut list = DrawList::new(scale);
+            ts.begin_frame();
+            let spin_angle = start.elapsed().as_secs_f32() * 12.0;
+            let preview_dims = ptex.current.as_ref().map(|(_, _, d)| *d);
+            let out = ui::build_frame(
+                &mut ui,
+                &mut arena,
+                root,
+                &mut ts,
+                &mut list,
+                window,
+                spin_angle,
+                preview_dims,
+            );
+            animating = out.animating || ui.refocus;
+
+            let mut uploads = std::mem::take(&mut ts.pending);
+            uploads.append(&mut extra_uploads);
+            let preview_set = ptex.current.as_ref().map(|(_, s, _)| *s);
+            let mut recorded = false;
+            let result = gfx.render_frame(|phase, device, cmd, extent, frame_idx| match phase {
+                gfx::Phase::Upload => {
+                    recorded = true;
+                    renderer.record_pre(device, cmd, frame_idx, &list, &uploads)
+                }
+                gfx::Phase::Pass => {
+                    renderer.record_pass(
+                        device,
+                        cmd,
+                        extent,
+                        frame_idx,
+                        &list,
+                        atlas_set,
+                        preview_set,
+                    );
+                    Ok(())
+                }
+            });
+            if recorded {
+                frame_counter += 1;
+                ptex.destroy_old(&gfx.device, &renderer, frame_counter);
+            } else {
+                // Never recorded (acquire failed): keep the uploads for the
+                // retry, or cached glyphs/textures would point at
+                // never-filled texels.
+                extra_uploads = uploads;
+            }
+            match result {
+                Ok(true) => dirty = false,
+                Ok(false) => {
+                    if let Err(e) = gfx.recreate_swapchain(platform.physical_extent()) {
+                        eprintln!("swapchain recreate failed: {e}");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("render failed: {e}");
+                    break;
+                }
+            }
+        }
+    }
+
+    unsafe {
+        gfx.device.device_wait_idle().ok();
+        upload::destroy_texture(&gfx.device, &ts.texture);
+        if let Some((tex, _, _)) = &ptex.current {
+            upload::destroy_texture(&gfx.device, tex);
+        }
+        for (_, tex, _) in &ptex.retired {
+            upload::destroy_texture(&gfx.device, tex);
+        }
+    }
+    renderer.destroy(&gfx.device);
+}
+
+fn make_preview_texture(
+    gfx: &gfx::Gfx,
+    renderer: &Renderer2d,
+    img: &preview::DecodedImage,
+) -> Result<(Texture, vk::DescriptorSet), String> {
+    let tex = upload::create_texture(
+        &gfx.device,
+        &gfx.mem_props,
+        img.width,
+        img.height,
+        vk::Format::R8G8B8A8_UNORM,
+    )?;
+    match renderer.register_texture(&gfx.device, &tex) {
+        Ok(set) => Ok((tex, set)),
+        Err(e) => {
+            unsafe { upload::destroy_texture(&gfx.device, &tex) };
+            Err(e)
+        }
+    }
+}
+
+/// Returns true when the currently shown preview should be cleared (any row
+/// click, like the C preview_destroy call).
+#[allow(clippy::too_many_arguments)]
+fn handle_action(
+    action: Action,
+    arena: &mut NodeArena,
+    ui: &mut Ui,
+    tasks: &Tasks,
+    preview: &Preview,
+    file_handlers: &[handlers::Handler],
+    children: &mut Vec<std::process::Child>,
+    root: NodeId,
+    window: Point,
+) -> bool {
+    match action {
+        Action::Row { node, item } => {
+            let Some(n) = arena.get(node) else { return false };
+            let Some(it) = n.items.get(item) else { return false };
+            ui.selection = Some((node, item));
+            let path = n.path.join(&it.name);
+            ui.selected_path = Some(path.clone());
+            let is_dir = it.is_dir;
+            let can_scan = is_dir && it.child.is_none() && !it.scanning;
+            // Any selection change invalidates in-flight preview decodes.
+            if !is_dir && preview::previewable(&path) {
+                preview.request(path.clone());
+            } else {
+                preview.cancel();
+            }
+            // Marking `scanning` before spawning both shows the spinner and
+            // dedups double-clicks (the C version raced two threads here).
+            if can_scan {
+                if let Some(n) = arena.get_mut(node) {
+                    n.items[item].scanning = true;
+                }
+                tasks.spawn_scan(node, item, path);
+            }
+            return true;
+        }
+        Action::CloseNode { node } => {
+            arena.close_recursive(node);
+            if let Some((sel_node, _)) = ui.selection {
+                if arena.get(sel_node).is_none() {
+                    ui.selection = None;
+                    ui.selected_path = None;
+                }
+            }
+        }
+        Action::FocusRoot => {
+            if let Some(n) = arena.get(root) {
+                let r = n.rect;
+                ui.focus_to_rect(r, window);
+            }
+        }
+        Action::FocusSelection => {
+            if let Some((node, item)) = ui.selection {
+                if let Some(n) = arena.get(node) {
+                    if let Some(it) = n.items.get(item) {
+                        let r = it.rect.offset(n.rect.min);
+                        ui.focus_to_rect(r, window);
+                    }
+                }
+            }
+        }
+        Action::FocusParentItem => {
+            // Focus the item row in the parent that owns the selection's
+            // node (the C version's intent; its math added the wrong base).
+            if let Some((node, _)) = ui.selection {
+                let Some(n) = arena.get(node) else { return false };
+                if let Some((pid, pidx)) = n.parent {
+                    if let Some(p) = arena.get(pid) {
+                        if let Some(pit) = p.items.get(pidx) {
+                            let r = pit.rect.offset(p.rect.min);
+                            ui.focus_to_rect(r, window);
+                        }
+                    }
+                }
+            }
+        }
+        Action::FocusNodeTop => {
+            if let Some((node, _)) = ui.selection {
+                if let Some(n) = arena.get(node) {
+                    let r = n.rect;
+                    ui.focus_to_rect(r, window);
+                }
+            }
+        }
+        Action::CopyPath => {
+            // Arg-vector spawn: paths with spaces survive (the C
+            // string_concat version broke them).
+            if let Some(p) = &ui.selected_path {
+                if let Err(e) =
+                    handlers::spawn(OsStr::new("wl-copy"), &[p.as_os_str()], children)
+                {
+                    eprintln!("wl-copy failed: {e}");
+                }
+            }
+        }
+        Action::OpenTerminal => {
+            // The C app passed the selected *file* to foot -D, which foot
+            // rejects; use its directory.
+            if let Some(p) = &ui.selected_path {
+                let dir = if p.is_dir() { p.as_path() } else { p.parent().unwrap_or(p.as_path()) };
+                if let Err(e) = handlers::spawn(
+                    OsStr::new("foot"),
+                    &[OsStr::new("-D"), dir.as_os_str()],
+                    children,
+                ) {
+                    eprintln!("foot failed: {e}");
+                }
+            }
+        }
+        Action::OpenWith { node, item } => {
+            let Some(n) = arena.get(node) else { return false };
+            let Some(it) = n.items.get(item) else { return false };
+            let path = n.path.join(&it.name);
+            match handlers::find_handler(file_handlers, &path) {
+                Some(h) => {
+                    if let Err(e) = handlers::spawn_handler(h, &path, children) {
+                        eprintln!("handler failed for {}: {e}", path.display());
+                    }
+                }
+                None => eprintln!("no handler for {}", path.display()),
+            }
+        }
+        Action::NodeBody => {}
+    }
+    false
+}
+
+/// Apply a worker result on the main thread. The generational id check
+/// makes results for since-closed nodes drop harmlessly (the exact race the
+/// C app had).
+fn apply_task_result(
+    result: TaskResult,
+    arena: &mut NodeArena,
+    ui: &mut Ui,
+    ts: &mut TextSystem,
+    platform: &platform::wayland::Platform,
+) {
+    match result {
+        TaskResult::ScanDone { node, item, path, result } => {
+            let Some(n) = arena.get_mut(node) else { return };
+            let Some(it) = n.items.get_mut(item) else { return };
+            if !it.scanning {
+                return;
+            }
+            it.scanning = false;
+            match result {
+                Ok(data) => {
+                    let mut child = model::node_from_items(path, data);
+                    child.parent = Some((node, item));
+                    let child_id = arena.insert(child);
+                    if let Some(n) = arena.get_mut(node) {
+                        n.items[item].child = Some(child_id);
+                    }
+                    model::calc_size(arena, child_id, ts);
+                    if let Some(c) = arena.get(child_id) {
+                        let r = c.rect;
+                        let (lw, lh) = platform.logical_size;
+                        ui.focus_to_rect(r, Point::new(lw as f32, lh as f32));
+                    }
+                }
+                Err(e) => {
+                    // C returned NULL silently; at least log it.
+                    eprintln!("failed to open {}: {e}", path.display());
+                }
+            }
+        }
+        // PreviewDone is handled inline in the main loop (it needs gfx).
+        TaskResult::PreviewDone { .. } => unreachable!(),
+    }
+}

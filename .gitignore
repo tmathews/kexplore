@@ -3,4 +3,4 @@ kexplore
 *.o
 .cache
 compile_commands.json
-
+target/
