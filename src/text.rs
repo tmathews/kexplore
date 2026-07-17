@@ -290,7 +290,32 @@ impl TextSystem {
     /// Draw text with its top-left corner at `origin` (logical px), like the
     /// Pango draw_text2 did. Returns the advance width in logical px.
     pub fn draw(&mut self, list: &mut DrawList, origin: Point, s: &str, color: Rgba) -> f32 {
+        self.draw_impl(list, origin, s, color, None)
+    }
+
+    /// Like `draw`, but glyphs are clipped to `clip` (logical px): partial
+    /// glyphs get their quad and uv trimmed proportionally.
+    pub fn draw_clipped(
+        &mut self,
+        list: &mut DrawList,
+        origin: Point,
+        s: &str,
+        color: Rgba,
+        clip: crate::geom::Rect,
+    ) -> f32 {
+        self.draw_impl(list, origin, s, color, Some(clip))
+    }
+
+    fn draw_impl(
+        &mut self,
+        list: &mut DrawList,
+        origin: Point,
+        s: &str,
+        color: Rgba,
+        clip: Option<crate::geom::Rect>,
+    ) -> f32 {
         let scale = self.scale;
+        let clip_phys = clip.map(|c| [c.min.x * scale, c.min.y * scale, c.max.x * scale, c.max.y * scale]);
         let baseline_y = (origin.y + self.ascent()) * scale;
         let mut pen_x = origin.x * scale;
         let start_x = pen_x;
@@ -299,11 +324,65 @@ impl TextSystem {
             if g.w > 0.0 && g.h > 0.0 {
                 let x = (pen_x + g.xmin).round();
                 let y = (baseline_y + g.ytop).round();
-                list.glyph_quad_phys([x, y, x + g.w, y + g.h], g.uv, color);
+                let mut r = [x, y, x + g.w, y + g.h];
+                let mut uv = g.uv;
+                if let Some(c) = clip_phys {
+                    if r[0] >= c[2] || r[2] <= c[0] || r[1] >= c[3] || r[3] <= c[1] {
+                        pen_x += g.advance;
+                        continue;
+                    }
+                    // Trim quad to the clip rect, adjusting uv linearly.
+                    let (uw, uh) = (uv[2] - uv[0], uv[3] - uv[1]);
+                    if r[0] < c[0] {
+                        uv[0] += uw * (c[0] - r[0]) / g.w;
+                        r[0] = c[0];
+                    }
+                    if r[2] > c[2] {
+                        uv[2] -= uw * (r[2] - c[2]) / g.w;
+                        r[2] = c[2];
+                    }
+                    if r[1] < c[1] {
+                        uv[1] += uh * (c[1] - r[1]) / g.h;
+                        r[1] = c[1];
+                    }
+                    if r[3] > c[3] {
+                        uv[3] -= uh * (r[3] - c[3]) / g.h;
+                        r[3] = c[3];
+                    }
+                }
+                list.glyph_quad_phys(r, uv, color);
             }
             pen_x += g.advance;
         }
         (pen_x - start_x) / scale
+    }
+
+    /// X offset (logical px) of the caret sitting before byte `index`.
+    pub fn caret_x(&mut self, s: &str, index: usize) -> f32 {
+        let mut x = 0.0f32;
+        for (i, ch) in s.char_indices() {
+            if i >= index {
+                break;
+            }
+            if let Some(g) = self.glyph(ch) {
+                x += g.advance / self.scale;
+            }
+        }
+        x
+    }
+
+    /// Byte index of the caret position nearest to `x` (logical px from the
+    /// start of the string).
+    pub fn caret_index(&mut self, s: &str, x: f32) -> usize {
+        let mut acc = 0.0f32;
+        for (i, ch) in s.char_indices() {
+            let adv = self.glyph(ch).map(|g| g.advance / self.scale).unwrap_or(0.0);
+            if x < acc + adv * 0.5 {
+                return i;
+            }
+            acc += adv;
+        }
+        s.len()
     }
 }
 

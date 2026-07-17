@@ -64,4 +64,12 @@ impl Rect {
     pub fn intersects(self, o: Rect) -> bool {
         self.min.x <= o.max.x && o.min.x <= self.max.x && self.min.y <= o.max.y && o.min.y <= self.max.y
     }
+
+    pub fn intersect(self, o: Rect) -> Option<Rect> {
+        let r = Rect {
+            min: Point::new(self.min.x.max(o.min.x), self.min.y.max(o.min.y)),
+            max: Point::new(self.max.x.min(o.max.x), self.max.y.min(o.max.y)),
+        };
+        (r.min.x < r.max.x && r.min.y < r.max.y).then_some(r)
+    }
 }

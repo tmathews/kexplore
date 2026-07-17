@@ -10,13 +10,18 @@ use crate::gfx::renderer2d::{DrawList, Rgba, TexSlot};
 use crate::model::{NodeArena, NodeId};
 use crate::platform::wayland::PointerState;
 use crate::text::{Icon, TextSystem};
+use crate::textfield::TextField;
 
 pub const TOOLBAR_H: f32 = 62.0;
+/// Horizontal inset from the URL bar border to its text.
+pub const URL_PAD: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
     /// Dead surface that swallows clicks (toolbar background).
     None,
+    /// Click in the URL bar: begin/continue editing, position the caret.
+    UrlBar,
     FocusRoot,
     FocusSelection,
     FocusParentItem,
@@ -53,7 +58,11 @@ pub struct Ui {
     pub selected_path: Option<PathBuf>,
     pub hitboxes: Vec<Hitbox>,
     pub drag: DragState,
-    last_pointer: Point,
+    pub url: TextField,
+    /// URL bar rect from the last built frame (screen/logical px), for
+    /// caret positioning and click-away detection.
+    pub url_bar_rect: Rect,
+    pub last_pointer: Point,
 }
 
 /// Camera lerp: C used a fixed 0.16 per frame at ~60Hz; this is the
@@ -70,6 +79,8 @@ impl Ui {
             selected_path: None,
             hitboxes: Vec::new(),
             drag: DragState::None,
+            url: TextField::new(),
+            url_bar_rect: Rect::ZERO,
             last_pointer: Point::ZERO,
         }
     }
@@ -190,13 +201,14 @@ pub fn build_frame(
     window: Point,
     spin_angle: f32,
     preview: Option<(u32, u32)>,
+    caret_visible: bool,
 ) -> FrameOut {
     ui.hitboxes.clear();
     let mut out = FrameOut { animating: false };
     let camera = Rect { min: ui.camera, max: ui.camera.add(window) };
     draw_entries(ui, arena, root, ts, canvas, camera, spin_angle, &mut out);
     draw_preview(canvas, window, preview);
-    draw_navigation(ui, ts, overlay, window);
+    draw_navigation(ui, ts, overlay, window, caret_visible);
     out
 }
 
@@ -308,7 +320,13 @@ fn draw_entries(
 
 /// Port of draw_navigation: scene composite, frosted toolbar bar, six icon
 /// buttons, URL bar.
-fn draw_navigation(ui: &mut Ui, ts: &mut TextSystem, list: &mut DrawList, window: Point) {
+fn draw_navigation(
+    ui: &mut Ui,
+    ts: &mut TextSystem,
+    list: &mut DrawList,
+    window: Point,
+    caret_visible: bool,
+) {
     // Composite the offscreen canvas, then the blurred band under the bar.
     list.image_slot(Rect::from_xywh(0.0, 0.0, window.x, window.y), TexSlot::Scene);
     let band = Rect::from_xywh(0.0, 0.0, window.x, TOOLBAR_H);
@@ -346,10 +364,54 @@ fn draw_navigation(ui: &mut Ui, ts: &mut TextSystem, list: &mut DrawList, window
 
     // URL bar: y 16, height 31, to width-20 (draw_navigation's abwh quirk).
     let url_bar = Rect::from_xywh(ox, 16.0, window.x - ox - padding, 31.0);
-    list.rect_stroke(url_bar, Rgba::WHITE, 5.0, 1.0);
-    let text = match &ui.selected_path {
-        Some(p) => p.to_string_lossy().into_owned(),
-        None => "No selection...".to_string(),
+    ui.url_bar_rect = url_bar;
+    ui.hitboxes.push(Hitbox { area: url_bar, action: Action::UrlBar, drag: None });
+    let focused = ui.url.active;
+    list.rect_stroke(url_bar, Rgba::WHITE, 5.0, if focused { 2.0 } else { 1.0 });
+
+    let clip = Rect {
+        min: Point::new(url_bar.min.x + 5.0, url_bar.min.y),
+        max: Point::new(url_bar.max.x - 5.0, url_bar.max.y),
     };
-    ts.draw(list, Point::new(url_bar.min.x + 10.0, url_bar.min.y + 2.0), &text, Rgba::WHITE);
+    let text_y = url_bar.min.y + 2.0;
+
+    if focused {
+        // Keep the caret in view within the field.
+        let avail = (url_bar.width() - 2.0 * URL_PAD).max(10.0);
+        let caret_x = ts.caret_x(&ui.url.text, ui.url.caret);
+        if caret_x - ui.url.scroll > avail {
+            ui.url.scroll = caret_x - avail;
+        }
+        if caret_x < ui.url.scroll {
+            ui.url.scroll = caret_x;
+        }
+        let text_w = ts.measure(&ui.url.text).x;
+        ui.url.scroll = ui.url.scroll.clamp(0.0, (text_w - avail).max(0.0));
+
+        let origin = Point::new(url_bar.min.x + URL_PAD - ui.url.scroll, text_y);
+        let lh = ts.line_height();
+        if let Some((s, e)) = ui.url.selection() {
+            let x0 = origin.x + ts.caret_x(&ui.url.text, s);
+            let x1 = origin.x + ts.caret_x(&ui.url.text, e);
+            let sel = Rect { min: Point::new(x0, text_y), max: Point::new(x1, text_y + lh) };
+            if let Some(r) = sel.intersect(clip) {
+                list.rect(r, Rgba::new(0.35, 0.55, 1.0, 0.45), 0.0);
+            }
+        }
+        ts.draw_clipped(list, origin, &ui.url.text, Rgba::WHITE, clip);
+        if caret_visible {
+            let x = origin.x + caret_x;
+            let caret =
+                Rect { min: Point::new(x, text_y + 1.0), max: Point::new(x + 1.5, text_y + lh - 1.0) };
+            if let Some(r) = caret.intersect(clip) {
+                list.rect(r, Rgba::WHITE, 0.0);
+            }
+        }
+    } else {
+        let text = match &ui.selected_path {
+            Some(p) => p.to_string_lossy().into_owned(),
+            None => "No selection...".to_string(),
+        };
+        ts.draw_clipped(list, Point::new(url_bar.min.x + URL_PAD, text_y), &text, Rgba::WHITE, clip);
+    }
 }

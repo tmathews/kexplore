@@ -3,12 +3,18 @@
 //! (fractional via wp-fractional-scale-v1 + viewporter, with integer
 //! fallbacks). Port of the C app's klib/ layer.
 
+use std::time::{Duration, Instant};
+
 use wayland_client::{
     delegate_noop,
     globals::{registry_queue_init, GlobalListContents},
-    protocol::{wl_compositor, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_surface},
+    protocol::{
+        wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm,
+        wl_surface,
+    },
     Connection, Dispatch, EventQueue, QueueHandle, WEnum,
 };
+use xkbcommon::xkb;
 use wayland_cursor::CursorTheme;
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
@@ -30,6 +36,32 @@ pub struct PointerState {
     pub released: bool,
 }
 
+/// A resolved key press (or repeat) ready for the UI to consume.
+#[derive(Clone, Debug)]
+pub struct KeyEvent {
+    pub keysym: xkb::Keysym,
+    /// Committed text for this key (empty for e.g. arrows).
+    pub utf8: String,
+    pub ctrl: bool,
+    pub shift: bool,
+}
+
+struct RepeatState {
+    /// evdev keycode currently held (xkb keycode - 8)
+    key: u32,
+    next: Instant,
+}
+
+struct Keyboard {
+    _kbd: wl_keyboard::WlKeyboard,
+    context: xkb::Context,
+    state: Option<xkb::State>,
+    /// repeats per second / initial delay, from wl_keyboard.repeat_info
+    repeat_rate: u32,
+    repeat_delay_ms: u32,
+    repeat: Option<RepeatState>,
+}
+
 pub struct Platform {
     pub surface: wl_surface::WlSurface,
     /// Kept alive for the protocol objects' lifetimes.
@@ -39,6 +71,9 @@ pub struct Platform {
     _fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     _decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     pointer: Option<wl_pointer::WlPointer>,
+    keyboard: Option<Keyboard>,
+    /// Resolved key presses/repeats, drained by the main loop.
+    pub key_events: Vec<KeyEvent>,
     cursor_theme: Option<CursorTheme>,
     cursor_surface: Option<wl_surface::WlSurface>,
     outputs: Vec<(wl_output::WlOutput, i32)>,
@@ -121,6 +156,8 @@ pub fn init(title: &str, app_id: &str, logical: (u32, u32)) -> Result<Init, Stri
         _fractional: fractional,
         _decoration: decoration,
         pointer: None,
+        keyboard: None,
+        key_events: Vec::new(),
         cursor_theme,
         cursor_surface,
         outputs,
@@ -193,6 +230,28 @@ impl Platform {
     pub fn end_input_frame(&mut self) {
         self.pointer_state.pressed = false;
         self.pointer_state.released = false;
+    }
+
+    /// When the next key repeat is due, if a repeating key is held.
+    pub fn next_repeat_deadline(&self) -> Option<Instant> {
+        self.keyboard.as_ref().and_then(|k| k.repeat.as_ref()).map(|r| r.next)
+    }
+
+    /// Emit synthetic key events for any repeats that have come due.
+    pub fn process_key_repeats(&mut self, now: Instant) {
+        let Some(kb) = self.keyboard.as_mut() else { return };
+        if kb.repeat_rate == 0 {
+            return;
+        }
+        let interval = Duration::from_micros(1_000_000 / kb.repeat_rate.max(1) as u64);
+        let mut events = Vec::new();
+        if let (Some(rep), Some(state)) = (kb.repeat.as_mut(), kb.state.as_ref()) {
+            while rep.next <= now {
+                events.push(resolve_key(state, rep.key));
+                rep.next += interval;
+            }
+        }
+        self.key_events.extend(events);
     }
 
     fn set_cursor(&mut self, serial: u32) {
@@ -365,6 +424,102 @@ impl Dispatch<wl_seat::WlSeat, ()> for Platform {
             if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
                 state.pointer = Some(seat.get_pointer(qh, ()));
             }
+            if caps.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
+                state.keyboard = Some(Keyboard {
+                    _kbd: seat.get_keyboard(qh, ()),
+                    context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+                    state: None,
+                    repeat_rate: 25,
+                    repeat_delay_ms: 400,
+                    repeat: None,
+                });
+            }
+        }
+    }
+}
+
+fn resolve_key(state: &xkb::State, key: u32) -> KeyEvent {
+    let keycode = xkb::Keycode::new(key + 8);
+    let keysym = state.key_get_one_sym(keycode);
+    let mut utf8 = state.key_get_utf8(keycode);
+    // Strip control characters (Return, Escape, ^C...) from committed text.
+    utf8.retain(|c| !c.is_control());
+    KeyEvent {
+        keysym,
+        utf8,
+        ctrl: state.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE),
+        shift: state.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE),
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for Platform {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(kb) = state.keyboard.as_mut() else { return };
+        match event {
+            wl_keyboard::Event::Keymap { format: WEnum::Value(format), fd, size } => {
+                if format == wl_keyboard::KeymapFormat::XkbV1 {
+                    let keymap = unsafe {
+                        xkb::Keymap::new_from_fd(
+                            &kb.context,
+                            fd,
+                            size as usize,
+                            xkb::KEYMAP_FORMAT_TEXT_V1,
+                            xkb::KEYMAP_COMPILE_NO_FLAGS,
+                        )
+                    };
+                    if let Ok(Some(keymap)) = keymap {
+                        kb.state = Some(xkb::State::new(&keymap));
+                    }
+                }
+            }
+            wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                kb.repeat_rate = rate.max(0) as u32;
+                kb.repeat_delay_ms = delay.max(0) as u32;
+            }
+            wl_keyboard::Event::Modifiers {
+                mods_depressed, mods_latched, mods_locked, group, ..
+            } => {
+                if let Some(s) = kb.state.as_mut() {
+                    s.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                }
+            }
+            wl_keyboard::Event::Key {
+                key, state: WEnum::Value(key_state), ..
+            } => {
+                let Some(s) = kb.state.as_ref() else { return };
+                match key_state {
+                    wl_keyboard::KeyState::Pressed => {
+                        state.key_events.push(resolve_key(s, key));
+                        let keymap = s.get_keymap();
+                        if kb.repeat_rate > 0
+                            && keymap.key_repeats(xkb::Keycode::new(key + 8))
+                        {
+                            kb.repeat = Some(RepeatState {
+                                key,
+                                next: Instant::now()
+                                    + Duration::from_millis(kb.repeat_delay_ms as u64),
+                            });
+                        }
+                    }
+                    wl_keyboard::KeyState::Released => {
+                        if kb.repeat.as_ref().is_some_and(|r| r.key == key) {
+                            kb.repeat = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            wl_keyboard::Event::Leave { .. } => {
+                kb.repeat = None;
+            }
+            _ => {}
         }
     }
 }

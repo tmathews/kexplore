@@ -13,13 +13,19 @@ cargo build --release
 ```
 
 Runtime requirements: a Wayland compositor, a Vulkan 1.3 driver (any recent
-Mesa), `libwayland-client`. Everything else (font, icons, shaders) is
-embedded in the binary — no install step or data directory needed.
+Mesa), `libwayland-client`, `libxkbcommon`. Everything else (font, icons,
+shaders) is embedded in the binary — no install step or data directory
+needed.
 
 ## Usage
 
 Mouse only, like the C app:
 
+- **URL bar** — click to edit: type a directory path and press Enter to
+  re-root the canvas there (`~` expands). Caret, arrow keys (Ctrl for word
+  jumps), Shift-selection, Home/End, Ctrl+A/C/X/V (clipboard via
+  `wl-copy`/`wl-paste`); Esc or clicking away cancels back to showing the
+  selection. Long paths scroll and clip inside the field.
 - **Click a directory row** — open it as a new node (scanned on a worker
   thread; spinner shows while it loads).
 - **Click a file row** — select it; PNG/JPEG/WebP get a preview bottom-right;
@@ -111,4 +117,5 @@ Fixed:
 Cut (relative to C):
 - SVG file previews (kept toolbar SVGs as pre-rasterized PNGs; resvg was a
   disproportionate dependency for one preview format).
-- Keyboard input (the C app bound the keyboard but never acted on it).
+- Canvas keyboard navigation (h/j/k/l from the C TODO list) — the URL bar
+  is keyboard-driven, but node traversal is still mouse-only.
