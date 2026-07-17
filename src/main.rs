@@ -61,7 +61,7 @@ impl PreviewTex {
 
 fn main() {
     let platform::wayland::Init { conn, mut queue, mut platform } =
-        platform::wayland::init("Kallos Explore", "kallos-explore", (600, 440))
+        platform::wayland::init("Kallos Explore", "kallos-explore", (1280, 720))
             .unwrap_or_else(|e| {
                 eprintln!("failed to init wayland: {e}");
                 std::process::exit(1);
@@ -337,6 +337,11 @@ fn main() {
         if ui.step_camera(dt) {
             dirty = true;
         }
+        // Collision glide: nodes slide to their resolved positions.
+        let nodes_moving = model::step_nodes(&mut arena, dt);
+        if nodes_moving {
+            dirty = true;
+        }
 
         let caret_visible = if ui.url.active {
             let visible =
@@ -370,7 +375,7 @@ fn main() {
                 preview_dims,
                 caret_visible,
             );
-            animating = out.animating || ui.refocus;
+            animating = out.animating || ui.refocus || nodes_moving;
 
             let mut uploads = std::mem::take(&mut ts.pending);
             uploads.append(&mut extra_uploads);
@@ -752,11 +757,24 @@ fn apply_task_result(
                     let (lw, lh) = platform.logical_size;
                     let window = Point::new(lw as f32, lh as f32);
                     model::calc_size(arena, child_id, ts, ui::node_max_size(window));
-                    if let Some(c) = arena.get(child_id) {
-                        // Calm auto-focus: only pan if the new node spawned
-                        // outside the visible area.
-                        let r = c.rect;
-                        ui.ensure_visible(r, window);
+                    if let Some(cand) = arena.get(child_id).map(|c| c.rect) {
+                        // Collision: slide the newcomer (down/right only) to
+                        // the nearest free space so it never lands on top of
+                        // an existing node.
+                        let obstacles: Vec<geom::Rect> = arena
+                            .iter()
+                            .filter(|(id, _)| *id != child_id)
+                            .map(|(_, n)| n.rect)
+                            .collect();
+                        let target = model::resolve_collision(cand, &obstacles, false);
+                        if target != cand {
+                            if let Some(c) = arena.get_mut(child_id) {
+                                c.anim_to = Some(target.min);
+                            }
+                        }
+                        // Calm auto-focus: only pan if the resolved resting
+                        // place is outside the visible area.
+                        ui.ensure_visible(target, window);
                     }
                 }
                 Err(e) => {

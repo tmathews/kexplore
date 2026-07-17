@@ -31,6 +31,9 @@ pub struct Node {
     pub content_h: f32,
     /// Vertical scroll offset when content_h exceeds the box height.
     pub scroll: f32,
+    /// When set, the box glides its min corner toward this point (collision
+    /// resolve after an open or a drag-release); cleared on arrival.
+    pub anim_to: Option<Point>,
 }
 
 pub struct Item {
@@ -76,6 +79,13 @@ impl NodeArena {
             self.slots.push(Slot { gen: 0, node: Some(node) });
             NodeId { index: self.slots.len() as u32 - 1, gen: 0 }
         }
+    }
+
+    /// Iterate every live node with its id (order is arbitrary).
+    pub fn iter(&self) -> impl Iterator<Item = (NodeId, &Node)> {
+        self.slots.iter().enumerate().filter_map(|(i, slot)| {
+            slot.node.as_ref().map(|n| (NodeId { index: i as u32, gen: slot.gen }, n))
+        })
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Node> {
@@ -166,6 +176,7 @@ pub fn node_from_items(path: PathBuf, data: Vec<ItemData>) -> Node {
         content_w: 0.0,
         content_h: 0.0,
         scroll: 0.0,
+        anim_to: None,
     }
 }
 
@@ -212,4 +223,171 @@ pub fn calc_size(arena: &mut NodeArena, id: NodeId, ts: &mut TextSystem, max_siz
     let box_w = node.content_w.min(max_size.x);
     let box_h = node.content_h.min(max_size.y);
     node.rect = Rect { min: origin, max: Point::new(origin.x + box_w, origin.y + box_h) };
+}
+
+/// Empty space kept between node boxes when collision-resolving.
+const NODE_GAP: f32 = 12.0;
+
+/// Strict overlap: touching edges (and the NODE_GAP margin) do not count, so
+/// a box pushed exactly NODE_GAP clear of an obstacle reads as separated and
+/// the resolver terminates.
+fn overlaps(a: Rect, b: Rect) -> bool {
+    a.min.x < b.max.x && b.min.x < a.max.x && a.min.y < b.max.y && b.min.y < a.max.y
+}
+
+/// Slide `cand` straight down until it clears every obstacle. Monotonic in y
+/// (each step drops below the lowest obstacle it currently hits), so it
+/// always converges — there is always free space below the lowest node.
+fn slide_down(cand: Rect, obstacles: &[Rect]) -> Rect {
+    let mut r = cand;
+    for _ in 0..256 {
+        let mut new_top = r.min.y;
+        for o in obstacles {
+            if overlaps(r, *o) {
+                new_top = new_top.max(o.max.y + NODE_GAP);
+            }
+        }
+        if new_top == r.min.y {
+            return r;
+        }
+        r = r.offset(Point::new(0.0, new_top - r.min.y));
+    }
+    r
+}
+
+/// Find a non-overlapping position for `cand` given the other nodes'
+/// `obstacles`.
+///
+/// Freshly opened nodes (`allow_up_left = false`) simply slide down past
+/// whatever they land on, so a new box stacks below its neighbors and never
+/// jumps above or before its parent.
+///
+/// Dropped nodes (`allow_up_left = true`) snap to the nearest free spot: we
+/// probe the four edge-aligned positions around each obstacle (keeping the
+/// unblocked coordinate) and pick the collision-free one closest to where the
+/// node was dropped, falling back to a slide-down if the area is too crowded.
+pub fn resolve_collision(cand: Rect, obstacles: &[Rect], allow_up_left: bool) -> Rect {
+    if obstacles.iter().all(|o| !overlaps(cand, *o)) {
+        return cand;
+    }
+    if !allow_up_left {
+        return slide_down(cand, obstacles);
+    }
+    let (w, h) = (cand.width(), cand.height());
+    let mut best: Option<Rect> = None;
+    let mut consider = |min: Point| {
+        let r = Rect { min, max: Point::new(min.x + w, min.y + h) };
+        if obstacles.iter().all(|o| !overlaps(r, *o)) {
+            let d = min.sub(cand.min).length();
+            if best.map_or(true, |b| d < b.min.sub(cand.min).length()) {
+                best = Some(r);
+            }
+        }
+    };
+    for o in obstacles {
+        consider(Point::new(cand.min.x, o.max.y + NODE_GAP)); // below
+        consider(Point::new(cand.min.x, o.min.y - NODE_GAP - h)); // above
+        consider(Point::new(o.max.x + NODE_GAP, cand.min.y)); // right
+        consider(Point::new(o.min.x - NODE_GAP - w, cand.min.y)); // left
+    }
+    best.unwrap_or_else(|| slide_down(cand, obstacles))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{overlaps, resolve_collision, NODE_GAP};
+    use crate::geom::{Point, Rect};
+
+    fn r(x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect::from_xywh(x, y, w, h)
+    }
+
+    #[test]
+    fn no_obstacles_is_identity() {
+        let c = r(0.0, 0.0, 100.0, 80.0);
+        assert_eq!(resolve_collision(c, &[], false), c);
+        assert_eq!(resolve_collision(c, &[], true), c);
+    }
+
+    #[test]
+    fn open_slides_newcomer_clear_without_going_up_or_left() {
+        // Fully overlapping; down/right-only search must not move up or left.
+        let obstacle = r(0.0, 0.0, 100.0, 100.0);
+        let cand = r(0.0, 0.0, 100.0, 100.0);
+        let out = resolve_collision(cand, &[obstacle], false);
+        assert!(!overlaps(out, obstacle));
+        assert!(out.min.x >= cand.min.x - 0.01);
+        assert!(out.min.y >= cand.min.y - 0.01);
+    }
+
+    #[test]
+    fn drag_may_push_up_or_left_when_that_is_nearest() {
+        // Candidate sits near the obstacle's top-left corner, so the shortest
+        // escape is up or left — only allowed with allow_up_left.
+        let obstacle = r(0.0, 0.0, 100.0, 100.0);
+        let cand = r(10.0, 10.0, 20.0, 20.0);
+        let out = resolve_collision(cand, &[obstacle], true);
+        assert!(!overlaps(out, obstacle));
+        assert!(out.min.x < cand.min.x || out.min.y < cand.min.y);
+    }
+
+    #[test]
+    fn keeps_at_least_the_gap() {
+        let obstacle = r(0.0, 0.0, 100.0, 100.0);
+        let cand = r(50.0, 50.0, 100.0, 100.0);
+        let out = resolve_collision(cand, &[obstacle], false);
+        assert!(!overlaps(out, obstacle));
+        // Cleared on some axis by at least the gap.
+        let clears_down = out.min.y >= obstacle.max.y + NODE_GAP - 0.01;
+        let clears_right = out.min.x >= obstacle.max.x + NODE_GAP - 0.01;
+        assert!(clears_down || clears_right);
+    }
+
+    #[test]
+    fn resolves_against_multiple_obstacles() {
+        let obstacles = [
+            r(0.0, 0.0, 100.0, 100.0),
+            r(0.0, 120.0, 100.0, 100.0),
+            r(120.0, 0.0, 100.0, 100.0),
+        ];
+        let cand = r(10.0, 10.0, 90.0, 90.0);
+        let out = resolve_collision(cand, &obstacles, true);
+        for o in &obstacles {
+            assert!(!overlaps(out, *o), "still overlaps {:?}", o);
+        }
+    }
+
+    #[test]
+    fn overlaps_is_strict_at_edges() {
+        // Edge-touching boxes are not overlapping (so a gap-cleared box ends
+        // the search).
+        let a = r(0.0, 0.0, 10.0, 10.0);
+        let b = r(10.0, 0.0, 10.0, 10.0);
+        assert!(!overlaps(a, b));
+        let c = r(5.0, 5.0, 10.0, 10.0);
+        assert!(overlaps(a, c));
+        let _ = Point::ZERO;
+    }
+}
+
+/// Advance any node gliding toward its `anim_to` target; returns true while
+/// at least one is still moving so the caller keeps the frame loop awake.
+/// Uses the same frame-rate-independent lerp as the camera.
+pub fn step_nodes(arena: &mut NodeArena, dt: f32) -> bool {
+    const RATE: f32 = 10.5;
+    let t = 1.0 - (-RATE * dt).exp();
+    let mut moving = false;
+    for slot in &mut arena.slots {
+        let Some(node) = &mut slot.node else { continue };
+        let Some(target) = node.anim_to else { continue };
+        let next = node.rect.min.lerp(target, t);
+        if target.sub(next).length() < 0.5 {
+            node.rect = node.rect.offset(target.sub(node.rect.min));
+            node.anim_to = None;
+        } else {
+            node.rect = node.rect.offset(next.sub(node.rect.min));
+            moving = true;
+        }
+    }
+    moving
 }

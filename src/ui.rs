@@ -224,6 +224,8 @@ impl Ui {
                 }
                 DragState::Node(id) => {
                     if let Some(node) = arena.get_mut(id) {
+                        // Grabbing a node cancels any in-flight collision glide.
+                        node.anim_to = None;
                         node.rect = node.rect.offset(delta);
                         dirty = true;
                     }
@@ -250,6 +252,23 @@ impl Ui {
                     action = Some((h.action, double));
                 } else {
                     self.last_click = None;
+                }
+            }
+            if let DragState::Node(id) = self.drag {
+                // Snap-on-release: if the dropped node overlaps others, glide
+                // it to the nearest free spot (search all four directions).
+                if let Some(cand) = arena.get(id).map(|n| n.rect) {
+                    let obstacles: Vec<Rect> = arena
+                        .iter()
+                        .filter(|(other, _)| *other != id)
+                        .map(|(_, n)| n.rect)
+                        .collect();
+                    let target = crate::model::resolve_collision(cand, &obstacles, true);
+                    if target != cand {
+                        if let Some(node) = arena.get_mut(id) {
+                            node.anim_to = Some(target.min);
+                        }
+                    }
                 }
             }
             if !matches!(self.drag, DragState::None) {
