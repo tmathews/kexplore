@@ -64,11 +64,11 @@ the window moves between differently-scaled outputs.
   ```
 
 - **Icons**: `assets/icons/*.png` are pre-rasterized from the SVG sources in
-  `../data/` (which remain the source of truth). To regenerate:
+  `data/` (which remain the source of truth). To regenerate:
 
   ```sh
   for i in home close selection top parent copy open terminal; do
-      rsvg-convert -w 64 -h 64 ../data/$i.svg > assets/icons/$i.png
+      rsvg-convert -w 64 -h 64 data/$i.svg > assets/icons/$i.png
   done
   ```
 
