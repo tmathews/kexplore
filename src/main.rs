@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use ash::vk;
 use geom::Point;
-use gfx::renderer2d::{DrawList, Renderer2d};
+use gfx::renderer2d::{DrawList, Renderer2d, TexSets};
 use gfx::upload::{self, PendingUpload, Texture};
 use model::{NodeArena, NodeId};
 use preview::Preview;
@@ -61,11 +61,17 @@ fn main() {
 
     let display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
     let surface_ptr = platform.surface.id().as_ptr() as *mut std::ffi::c_void;
-    let mut gfx = gfx::Gfx::new(display_ptr, surface_ptr, platform.physical_extent())
-        .unwrap_or_else(|e| {
-            eprintln!("failed to init vulkan: {e}");
-            std::process::exit(1);
-        });
+    let band_h = |scale: f64| (ui::TOOLBAR_H as f64 * scale).round().max(1.0) as u32;
+    let mut gfx = gfx::Gfx::new(
+        display_ptr,
+        surface_ptr,
+        platform.physical_extent(),
+        band_h(platform.scale()),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("failed to init vulkan: {e}");
+        std::process::exit(1);
+    });
     let mut renderer = Renderer2d::new(&gfx.device, gfx.mem_props, gfx.swapchain.format)
         .unwrap_or_else(|e| {
             eprintln!("failed to init renderer: {e}");
@@ -77,6 +83,8 @@ fn main() {
             std::process::exit(1);
         });
     let atlas_set = renderer.register_texture(&gfx.device, &ts.texture).expect("atlas set");
+    let mut scene_set = renderer.register_texture(&gfx.device, &gfx.blur.scene).expect("scene set");
+    let mut blur_set = renderer.register_texture(&gfx.device, &gfx.blur.blur_b).expect("blur set");
 
     // Root node: the user's home directory, like the C app.
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
@@ -176,10 +184,20 @@ fn main() {
             platform.scale_changed = false;
             platform.apply_scale();
             ts.set_scale(platform.scale() as f32);
-            if let Err(e) = gfx.recreate_swapchain(platform.physical_extent()) {
+            if let Err(e) =
+                gfx.recreate_swapchain(platform.physical_extent(), band_h(platform.scale()))
+            {
                 eprintln!("swapchain recreate failed: {e}");
                 break;
             }
+            // The offscreen targets were recreated; point the overlay's
+            // descriptor sets at the new views.
+            renderer.free_texture_set(&gfx.device, scene_set);
+            renderer.free_texture_set(&gfx.device, blur_set);
+            scene_set =
+                renderer.register_texture(&gfx.device, &gfx.blur.scene).expect("scene set");
+            blur_set =
+                renderer.register_texture(&gfx.device, &gfx.blur.blur_b).expect("blur set");
             dirty = true;
         }
 
@@ -216,7 +234,8 @@ fn main() {
 
         if dirty || animating {
             let scale = platform.scale() as f32;
-            let mut list = DrawList::new(scale);
+            let mut canvas = DrawList::new(scale);
+            let mut overlay = DrawList::new(scale);
             ts.begin_frame();
             let spin_angle = start.elapsed().as_secs_f32() * 12.0;
             let preview_dims = ptex.current.as_ref().map(|(_, _, d)| *d);
@@ -225,7 +244,8 @@ fn main() {
                 &mut arena,
                 root,
                 &mut ts,
-                &mut list,
+                &mut canvas,
+                &mut overlay,
                 window,
                 spin_angle,
                 preview_dims,
@@ -234,23 +254,28 @@ fn main() {
 
             let mut uploads = std::mem::take(&mut ts.pending);
             uploads.append(&mut extra_uploads);
-            let preview_set = ptex.current.as_ref().map(|(_, s, _)| *s);
+            let sets = TexSets {
+                atlas: atlas_set,
+                preview: ptex.current.as_ref().map(|(_, s, _)| *s),
+                scene: Some(scene_set),
+                blur: Some(blur_set),
+            };
             let mut recorded = false;
+            let mut offsets: Vec<u32> = Vec::new();
             let result = gfx.render_frame(|phase, device, cmd, extent, frame_idx| match phase {
                 gfx::Phase::Upload => {
                     recorded = true;
-                    renderer.record_pre(device, cmd, frame_idx, &list, &uploads)
+                    offsets =
+                        renderer.record_pre(device, cmd, frame_idx, &[&canvas, &overlay], &uploads)?;
+                    Ok(())
                 }
-                gfx::Phase::Pass => {
-                    renderer.record_pass(
-                        device,
-                        cmd,
-                        extent,
-                        frame_idx,
-                        &list,
-                        atlas_set,
-                        preview_set,
-                    );
+                gfx::Phase::Scene => {
+                    renderer.record_pass(device, cmd, extent, frame_idx, &canvas, offsets[0], &sets);
+                    Ok(())
+                }
+                gfx::Phase::Overlay => {
+                    renderer
+                        .record_pass(device, cmd, extent, frame_idx, &overlay, offsets[1], &sets);
                     Ok(())
                 }
             });
@@ -266,10 +291,20 @@ fn main() {
             match result {
                 Ok(true) => dirty = false,
                 Ok(false) => {
-                    if let Err(e) = gfx.recreate_swapchain(platform.physical_extent()) {
+                    if let Err(e) =
+                        gfx.recreate_swapchain(platform.physical_extent(), band_h(platform.scale()))
+                    {
                         eprintln!("swapchain recreate failed: {e}");
                         break;
                     }
+                    renderer.free_texture_set(&gfx.device, scene_set);
+                    renderer.free_texture_set(&gfx.device, blur_set);
+                    scene_set = renderer
+                        .register_texture(&gfx.device, &gfx.blur.scene)
+                        .expect("scene set");
+                    blur_set = renderer
+                        .register_texture(&gfx.device, &gfx.blur.blur_b)
+                        .expect("blur set");
                 }
                 Err(e) => {
                     eprintln!("render failed: {e}");
@@ -438,7 +473,7 @@ fn handle_action(
                 None => eprintln!("no handler for {}", path.display()),
             }
         }
-        Action::NodeBody => {}
+        Action::NodeBody | Action::None => {}
     }
     false
 }

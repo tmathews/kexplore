@@ -47,6 +47,31 @@ pub struct Vertex {
 pub enum TexSlot {
     Atlas,
     Preview,
+    /// Offscreen canvas texture, composited by the overlay pass.
+    Scene,
+    /// Blurred toolbar band.
+    Blur,
+}
+
+/// Descriptor sets for each slot a draw list may reference. Missing optional
+/// slots fall back to the atlas (harmless: nothing meaningful samples them).
+#[derive(Clone, Copy)]
+pub struct TexSets {
+    pub atlas: vk::DescriptorSet,
+    pub preview: Option<vk::DescriptorSet>,
+    pub scene: Option<vk::DescriptorSet>,
+    pub blur: Option<vk::DescriptorSet>,
+}
+
+impl TexSets {
+    fn get(&self, slot: TexSlot) -> vk::DescriptorSet {
+        match slot {
+            TexSlot::Atlas => self.atlas,
+            TexSlot::Preview => self.preview.unwrap_or(self.atlas),
+            TexSlot::Scene => self.scene.unwrap_or(self.atlas),
+            TexSlot::Blur => self.blur.unwrap_or(self.atlas),
+        }
+    }
 }
 
 struct Range {
@@ -210,7 +235,13 @@ impl DrawList {
 
     /// Textured RGBA quad (the preview image).
     pub fn image(&mut self, r: Rect) {
-        self.require_tex(TexSlot::Preview);
+        self.image_slot(r, TexSlot::Preview);
+    }
+
+    /// Full-uv textured quad sampling an arbitrary slot (scene composite,
+    /// blurred band).
+    pub fn image_slot(&mut self, r: Rect, slot: TexSlot) {
+        self.require_tex(slot);
         let s = self.scale;
         let (x0, y0) = (r.min.x * s, r.min.y * s);
         let (x1, y1) = (r.max.x * s, r.max.y * s);
@@ -481,19 +512,20 @@ impl Renderer2d {
         }
     }
 
-    /// Phase 1, outside the render pass: upload vertices + pending texture
-    /// data. Must run after this frame's fence has been waited on.
+    /// Phase 1, outside the render pass: upload the vertices of all lists
+    /// (concatenated) + pending texture data. Must run after this frame's
+    /// fence has been waited on. Returns each list's base vertex offset.
     pub fn record_pre(
         &mut self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
         frame_idx: usize,
-        list: &DrawList,
+        lists: &[&DrawList],
         uploads: &[PendingUpload],
-    ) -> Result<(), String> {
+    ) -> Result<Vec<u32>, String> {
         let fb = &mut self.frames[frame_idx];
 
-        let vb_size = list.byte_size();
+        let vb_size: u64 = lists.iter().map(|l| l.byte_size()).sum();
         if vb_size > fb.vertex.size {
             unsafe { upload::destroy_buffer(device, &fb.vertex) };
             fb.vertex = upload::create_host_buffer(
@@ -503,11 +535,23 @@ impl Renderer2d {
                 vk::BufferUsageFlags::VERTEX_BUFFER,
             )?;
         }
-        if vb_size > 0 {
+        let mut offsets = Vec::with_capacity(lists.len());
+        let mut byte_off = 0usize;
+        let mut vert_off = 0u32;
+        for list in lists {
+            offsets.push(vert_off);
             let bytes: &[u8] = bytemuck::cast_slice(&list.verts);
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), fb.vertex.mapped, bytes.len());
+            if !bytes.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        fb.vertex.mapped.add(byte_off),
+                        bytes.len(),
+                    );
+                }
             }
+            byte_off += bytes.len();
+            vert_off += list.verts.len() as u32;
         }
 
         let up_size = upload::uploads_byte_size(uploads);
@@ -521,10 +565,11 @@ impl Renderer2d {
             )?;
         }
         upload::record_uploads(device, cmd, &fb.staging, uploads);
-        Ok(())
+        Ok(offsets)
     }
 
-    /// Phase 2, inside the render pass: bind and draw all ranges.
+    /// Phase 2, inside a render pass: bind and draw all ranges of one list,
+    /// whose vertices start at `base` in this frame's vertex buffer.
     pub fn record_pass(
         &self,
         device: &ash::Device,
@@ -532,8 +577,8 @@ impl Renderer2d {
         extent: vk::Extent2D,
         frame_idx: usize,
         list: &DrawList,
-        atlas_set: vk::DescriptorSet,
-        preview_set: Option<vk::DescriptorSet>,
+        base: u32,
+        sets: &TexSets,
     ) {
         if list.is_empty() {
             return;
@@ -570,22 +615,15 @@ impl Renderer2d {
                 if range.count == 0 {
                     continue;
                 }
-                let set = match range.tex {
-                    TexSlot::Atlas => atlas_set,
-                    TexSlot::Preview => match preview_set {
-                        Some(s) => s,
-                        None => atlas_set, // preview vanished mid-frame; harmless
-                    },
-                };
                 device.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.pipeline_layout,
                     0,
-                    &[set],
+                    &[sets.get(range.tex)],
                     &[],
                 );
-                device.cmd_draw(cmd, range.count, 1, range.first, 0);
+                device.cmd_draw(cmd, range.count, 1, base + range.first, 0);
             }
         }
     }

@@ -6,13 +6,17 @@
 use std::path::PathBuf;
 
 use crate::geom::{Point, Rect};
-use crate::gfx::renderer2d::{DrawList, Rgba};
+use crate::gfx::renderer2d::{DrawList, Rgba, TexSlot};
 use crate::model::{NodeArena, NodeId};
 use crate::platform::wayland::PointerState;
 use crate::text::{Icon, TextSystem};
 
+pub const TOOLBAR_H: f32 = 62.0;
+
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
+    /// Dead surface that swallows clicks (toolbar background).
+    None,
     FocusRoot,
     FocusSelection,
     FocusParentItem,
@@ -71,14 +75,18 @@ impl Ui {
     }
 
     /// Port of focus_to_rect, including its odd `cam_half - 100` clamp for
-    /// rects taller than the view.
+    /// rects taller than the view — but centering within the visible region
+    /// below the toolbar instead of the whole window, so focused content
+    /// no longer lands under the bar.
     pub fn focus_to_rect(&mut self, rect: Rect, window: Point) {
-        let cam_half = Point::new(window.x * 0.5, window.y * 0.5);
+        let avail_h = (window.y - TOOLBAR_H).max(1.0);
+        let cam_half = Point::new(window.x * 0.5, avail_h * 0.5);
         let mut frame_half = Point::new(rect.width() * 0.5, rect.height() * 0.5);
         if frame_half.y > cam_half.y {
             frame_half.y = cam_half.y - 100.0;
         }
-        self.camera_target = rect.min.sub(cam_half).add(frame_half);
+        self.camera_target =
+            rect.min.sub(Point::new(cam_half.x, TOOLBAR_H + cam_half.y)).add(frame_half);
         self.refocus = true;
     }
 
@@ -167,15 +175,18 @@ pub struct FrameOut {
     pub animating: bool,
 }
 
-/// Build the whole frame: node tree, preview placeholder, toolbar. Fills
-/// `ui.hitboxes` for next iteration's input.
+/// Build the whole frame: the canvas list (nodes + preview) renders into the
+/// offscreen scene texture; the overlay list (scene composite + blurred band
+/// + toolbar) renders into the swapchain. Fills `ui.hitboxes` for next
+/// iteration's input.
 #[allow(clippy::too_many_arguments)]
 pub fn build_frame(
     ui: &mut Ui,
     arena: &mut NodeArena,
     root: NodeId,
     ts: &mut TextSystem,
-    list: &mut DrawList,
+    canvas: &mut DrawList,
+    overlay: &mut DrawList,
     window: Point,
     spin_angle: f32,
     preview: Option<(u32, u32)>,
@@ -183,9 +194,9 @@ pub fn build_frame(
     ui.hitboxes.clear();
     let mut out = FrameOut { animating: false };
     let camera = Rect { min: ui.camera, max: ui.camera.add(window) };
-    draw_entries(ui, arena, root, ts, list, camera, spin_angle, &mut out);
-    draw_preview(list, window, preview);
-    draw_navigation(ui, ts, list, window);
+    draw_entries(ui, arena, root, ts, canvas, camera, spin_angle, &mut out);
+    draw_preview(canvas, window, preview);
+    draw_navigation(ui, ts, overlay, window);
     out
 }
 
@@ -295,10 +306,24 @@ fn draw_entries(
     }
 }
 
-/// Port of draw_navigation: toolbar bar, six icon buttons, URL bar.
+/// Port of draw_navigation: scene composite, frosted toolbar bar, six icon
+/// buttons, URL bar.
 fn draw_navigation(ui: &mut Ui, ts: &mut TextSystem, list: &mut DrawList, window: Point) {
-    list.solid(Rect::from_xywh(0.0, 0.0, window.x, 62.0), Rgba::new(0.0, 0.0, 0.0, 0.9));
-    list.line(Point::new(0.0, 62.0), Point::new(window.x, 62.0), 1.0, Rgba::new(1.0, 1.0, 1.0, 0.3));
+    // Composite the offscreen canvas, then the blurred band under the bar.
+    list.image_slot(Rect::from_xywh(0.0, 0.0, window.x, window.y), TexSlot::Scene);
+    let band = Rect::from_xywh(0.0, 0.0, window.x, TOOLBAR_H);
+    list.image_slot(band, TexSlot::Blur);
+    // Lighter tint than the C 0.9 so the frosted backdrop reads through.
+    list.solid(band, Rgba::new(0.0, 0.0, 0.0, 0.55));
+    list.line(
+        Point::new(0.0, TOOLBAR_H),
+        Point::new(window.x, TOOLBAR_H),
+        1.0,
+        Rgba::new(1.0, 1.0, 1.0, 0.3),
+    );
+    // The bar swallows clicks: rows hidden beneath it can't be clicked or
+    // dragged. Pushed before the buttons so they still win (reverse scan).
+    ui.hitboxes.push(Hitbox { area: band, action: Action::None, drag: None });
 
     let mut ox = 20.0;
     let oy = 20.0;

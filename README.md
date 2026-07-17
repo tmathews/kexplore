@@ -27,7 +27,9 @@ Mouse only, like the C app:
 - **Drag a node** — move it. **Drag empty canvas** — pan the camera.
 - **Close button** above a node closes its whole subtree.
 - Toolbar: focus home / focus selection / focus parent / focus top of node /
-  copy path (`wl-copy`) / open terminal (`foot -D <dir>`).
+  copy path (`wl-copy`) / open terminal (`foot -D <dir>`). The bar floats
+  over the canvas with a frosted-glass blur of whatever scrolls beneath it;
+  it swallows clicks, and camera focus targets the area below it.
 
 ## Handlers
 
@@ -59,8 +61,9 @@ the window moves between differently-scaled outputs.
   rebuild them manually (no build-time dependency on a compiler):
 
   ```sh
-  glslc shaders/ui.vert -o shaders/ui.vert.spv
-  glslc shaders/ui.frag -o shaders/ui.frag.spv
+  for s in ui.vert ui.frag blur.vert blur.frag; do
+      glslc shaders/$s -o shaders/$s.spv
+  done
   ```
 
 - **Icons**: `assets/icons/*.png` are pre-rasterized from the SVG sources in

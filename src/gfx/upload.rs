@@ -76,13 +76,32 @@ pub unsafe fn destroy_buffer(device: &ash::Device, b: &Buffer) {
     device.free_memory(b.mem, None);
 }
 
-/// Create a device-local sampled texture (no contents yet; layout UNDEFINED).
+/// Create a device-local sampled texture for uploads (layout UNDEFINED).
 pub fn create_texture(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     width: u32,
     height: u32,
     format: vk::Format,
+) -> Result<Texture, String> {
+    create_texture_ex(
+        device,
+        mem_props,
+        width,
+        height,
+        format,
+        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+    )
+}
+
+/// Create a device-local texture with explicit usage (e.g. render targets).
+pub fn create_texture_ex(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
 ) -> Result<Texture, String> {
     unsafe {
         let image = device
@@ -95,7 +114,7 @@ pub fn create_texture(
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    .usage(usage)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .initial_layout(vk::ImageLayout::UNDEFINED),
                 None,

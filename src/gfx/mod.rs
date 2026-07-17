@@ -1,6 +1,7 @@
 //! Vulkan context: instance, device, queue, per-frame resources and the
 //! frame render loop. Requires Vulkan 1.3 (dynamicRendering + sync2).
 
+pub mod blur;
 pub mod renderer2d;
 pub mod swapchain;
 pub mod upload;
@@ -14,8 +15,12 @@ pub const FRAMES_IN_FLIGHT: usize = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    /// Before any pass: vertex/texture uploads.
     Upload,
-    Pass,
+    /// Inside the offscreen canvas pass (cleared to the background color).
+    Scene,
+    /// Inside the swapchain pass (scene composite + toolbar draw here).
+    Overlay,
 }
 
 pub struct FrameRes {
@@ -37,6 +42,7 @@ pub struct Gfx {
     pub swapchain_loader: ash::khr::swapchain::Device,
     pub swapchain: Swapchain,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
+    pub blur: blur::Blur,
     frames: Vec<FrameRes>,
     /// One present-wait semaphore per swapchain image (a per-frame semaphore
     /// could still be pending when reused).
@@ -60,14 +66,16 @@ impl Gfx {
         display_ptr: *mut c_void,
         surface_ptr: *mut c_void,
         extent: (u32, u32),
+        band_h: u32,
     ) -> Result<Gfx, String> {
-        unsafe { Self::new_inner(display_ptr, surface_ptr, extent) }
+        unsafe { Self::new_inner(display_ptr, surface_ptr, extent, band_h) }
     }
 
     unsafe fn new_inner(
         display_ptr: *mut c_void,
         surface_ptr: *mut c_void,
         extent: (u32, u32),
+        band_h: u32,
     ) -> Result<Gfx, String> {
         let entry = ash::Entry::load().map_err(|e| format!("load libvulkan: {e}"))?;
 
@@ -229,6 +237,8 @@ impl Gfx {
             frames.push(FrameRes { pool, cmd, image_available, fence });
         }
         let present_sems = Self::make_present_sems(&device, swapchain.images.len())?;
+        let blur =
+            blur::Blur::new(&device, &mem_props, swapchain.format, swapchain.extent, band_h)?;
 
         Ok(Gfx {
             _entry: entry,
@@ -242,6 +252,7 @@ impl Gfx {
             swapchain_loader,
             swapchain,
             mem_props,
+            blur,
             frames,
             present_sems,
             frame_idx: 0,
@@ -261,7 +272,7 @@ impl Gfx {
             .collect()
     }
 
-    pub fn recreate_swapchain(&mut self, extent: (u32, u32)) -> Result<(), String> {
+    pub fn recreate_swapchain(&mut self, extent: (u32, u32), band_h: u32) -> Result<(), String> {
         unsafe {
             self.device.device_wait_idle().ok();
         }
@@ -283,6 +294,7 @@ impl Gfx {
             }
         }
         self.present_sems = Self::make_present_sems(&self.device, self.swapchain.images.len())?;
+        self.blur.recreate(&self.device, &self.mem_props, self.swapchain.extent, band_h)?;
         Ok(())
     }
 
@@ -353,14 +365,68 @@ impl Gfx {
             );
         record(Phase::Upload, device, frame.cmd, extent, self.frame_idx)?;
 
+        // --- Scene pass: canvas into the offscreen texture ---
+        let scene_image = self.blur.scene.image;
+        let scene_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let scene_to_attachment = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED) // fully redrawn each frame
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(scene_image)
+            .subresource_range(scene_range);
+        device.cmd_pipeline_barrier2(
+            frame.cmd,
+            &vk::DependencyInfo::default()
+                .image_memory_barriers(std::slice::from_ref(&scene_to_attachment)),
+        );
+        // Premultiplied clear: rgb is already multiplied by a (rgb = 0).
+        let clear = vk::ClearValue {
+            color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.8] },
+        };
+        let scene_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(self.blur.scene.view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(clear);
+        let scene_rendering = vk::RenderingInfo::default()
+            .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
+            .layer_count(1)
+            .color_attachments(std::slice::from_ref(&scene_attachment));
+        device.cmd_begin_rendering(frame.cmd, &scene_rendering);
+        record(Phase::Scene, device, frame.cmd, extent, self.frame_idx)?;
+        device.cmd_end_rendering(frame.cmd);
+        let scene_to_read = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(scene_image)
+            .subresource_range(scene_range);
+        device.cmd_pipeline_barrier2(
+            frame.cmd,
+            &vk::DependencyInfo::default()
+                .image_memory_barriers(std::slice::from_ref(&scene_to_read)),
+        );
+
+        // --- Blur passes: toolbar band, H then V at half res ---
+        self.blur.record(device, frame.cmd);
+
+        // --- Overlay pass: composite + toolbar into the swapchain image ---
         device.cmd_pipeline_barrier2(
             frame.cmd,
             &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_attachment)),
         );
-
-        // Premultiplied clear: rgb is already multiplied by a (rgb = 0).
+        // Transparent clear; the scene composite quad supplies every pixel.
         let clear = vk::ClearValue {
-            color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.8] },
+            color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] },
         };
         let color_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(view)
@@ -374,7 +440,7 @@ impl Gfx {
             .color_attachments(std::slice::from_ref(&color_attachment));
         device.cmd_begin_rendering(frame.cmd, &rendering_info);
 
-        record(Phase::Pass, device, frame.cmd, extent, self.frame_idx)?;
+        record(Phase::Overlay, device, frame.cmd, extent, self.frame_idx)?;
 
         device.cmd_end_rendering(frame.cmd);
 
@@ -435,6 +501,7 @@ impl Drop for Gfx {
     fn drop(&mut self) {
         unsafe {
             self.device.device_wait_idle().ok();
+            self.blur.destroy(&self.device);
             for f in &self.frames {
                 self.device.destroy_semaphore(f.image_available, None);
                 self.device.destroy_fence(f.fence, None);
