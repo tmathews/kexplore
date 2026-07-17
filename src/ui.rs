@@ -22,7 +22,7 @@ pub fn node_max_size(window: Point) -> Point {
     Point::new(window.x * 0.9, (window.y - TOOLBAR_H).max(1.0) * 0.9)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
     /// Dead surface that swallows clicks (toolbar background).
     None,
@@ -69,6 +69,8 @@ pub struct Ui {
     /// caret positioning and click-away detection.
     pub url_bar_rect: Rect,
     pub last_pointer: Point,
+    /// What the pointer is over (from the previous frame's hitboxes).
+    pub hover: Option<Action>,
 }
 
 /// Camera lerp: C used a fixed 0.16 per frame at ~60Hz; this is the
@@ -88,6 +90,7 @@ impl Ui {
             url: TextField::new(),
             url_bar_rect: Rect::ZERO,
             last_pointer: Point::ZERO,
+            hover: None,
         }
     }
 
@@ -168,6 +171,18 @@ impl Ui {
             .find(|hb| hb.area.contains(cursor))
             .copied();
 
+        // Hover feedback: track what's under the pointer (suppressed while
+        // dragging so highlights don't chase the drag).
+        let hover = if matches!(self.drag, DragState::None | DragState::Pending { .. }) {
+            hit.map(|h| h.action)
+        } else {
+            None
+        };
+        if hover != self.hover {
+            self.hover = hover;
+            dirty = true;
+        }
+
         // Mouse wheel over a node scrolls its content.
         let wheel = pointer.scroll_delta as f32;
         if wheel != 0.0 {
@@ -231,6 +246,12 @@ impl Ui {
 const COLOR_BOX_FILL: Rgba = Rgba([0, 0, 0, 128]); // rgba(0,0,0,0.5)
 const COLOR_ROW_SELECTED: Rgba = Rgba([255, 0, 0, 255]);
 const COLOR_ROW_OPEN: Rgba = Rgba([0, 255, 0, 255]);
+const HOVER_ROW_BG: Rgba = Rgba([255, 255, 255, 26]); // white 0.10
+const HOVER_BUTTON_BG: Rgba = Rgba([255, 255, 255, 38]); // white 0.15
+
+fn inflate(r: Rect, by: f32) -> Rect {
+    Rect { min: Point::new(r.min.x - by, r.min.y - by), max: Point::new(r.max.x + by, r.max.y + by) }
+}
 
 pub struct FrameOut {
     /// keep rendering continuously (spinners visible)
@@ -311,12 +332,12 @@ fn draw_entries(
             // Close button: node.min + (2, -25), 20x20, like draw_entries.
             let r = Rect::from_xywh(node_rect.min.x + 2.0, node_rect.min.y - 25.0, 20.0, 20.0)
                 .offset(off);
+            let action = Action::CloseNode { node: id };
+            if ui.hover == Some(action) {
+                list.rect(inflate(r, 3.0), HOVER_BUTTON_BG, 5.0);
+            }
             list.glyph_quad(r, ts.icon_uv(Icon::Close), Rgba::WHITE, 0.0);
-            ui.hitboxes.push(Hitbox {
-                area: r,
-                action: Action::CloseNode { node: id },
-                drag: Some(id),
-            });
+            ui.hitboxes.push(Hitbox { area: r, action, drag: Some(id) });
         }
     }
 
@@ -333,8 +354,14 @@ fn draw_entries(
         let item = &node.items[i];
         let rect = item.rect.offset(node_rect.min).offset(Point::new(0.0, -scroll)); // world
         let screen_rect = rect.offset(off);
+        // The interactive row spans the node's inner width, not just the
+        // text extent.
+        let band = Rect {
+            min: Point::new(node_rect.min.x + 2.0, rect.min.y),
+            max: Point::new(node_rect.max.x - 2.0, rect.max.y),
+        };
         let row_in_box = rect.max.y > content_clip.min.y && rect.min.y < content_clip.max.y;
-        let in_view = camera.intersects(rect) && row_in_box;
+        let in_view = camera.intersects(band) && row_in_box;
         let selected = ui.selection == Some((id, i));
         let child = item.child;
         let is_dir = item.is_dir;
@@ -345,6 +372,12 @@ fn draw_entries(
         let side_x = rect.max.x.min(node_rect.max.x).max(node_rect.min.x) - camera.min.x;
 
         if in_view {
+            let row_action = Action::Row { node: id, item: i };
+            if ui.hover == Some(row_action) {
+                if let Some(bg) = band.intersect(content_clip) {
+                    list.rect(bg.offset(off), HOVER_ROW_BG, 3.0);
+                }
+            }
             let color = if selected {
                 COLOR_ROW_SELECTED
             } else if child.is_some() {
@@ -353,21 +386,17 @@ fn draw_entries(
                 Rgba::WHITE
             };
             ts.draw_clipped(list, screen_rect.min, &display, color, content_clip.offset(off));
-            if let Some(hb) = screen_rect.intersect(content_clip.offset(off)) {
-                ui.hitboxes.push(Hitbox {
-                    area: hb,
-                    action: Action::Row { node: id, item: i },
-                    drag: Some(id),
-                });
+            if let Some(hb) = band.offset(off).intersect(content_clip.offset(off)) {
+                ui.hitboxes.push(Hitbox { area: hb, action: row_action, drag: Some(id) });
             }
             if selected && !is_dir {
                 let r = Rect::from_xywh(side_x + 10.0, screen_rect.min.y + 4.0, 20.0, 20.0);
+                let action = Action::OpenWith { node: id, item: i };
+                if ui.hover == Some(action) {
+                    list.rect(inflate(r, 3.0), HOVER_BUTTON_BG, 5.0);
+                }
                 list.glyph_quad(r, ts.icon_uv(Icon::Open), Rgba::WHITE, 0.0);
-                ui.hitboxes.push(Hitbox {
-                    area: r,
-                    action: Action::OpenWith { node: id, item: i },
-                    drag: Some(id),
-                });
+                ui.hitboxes.push(Hitbox { area: r, action, drag: Some(id) });
             }
         }
 
@@ -448,6 +477,9 @@ fn draw_navigation(
     ];
     for (icon, action) in buttons {
         let r = Rect::from_xywh(ox, oy, size, size);
+        if ui.hover == Some(action) {
+            list.rect(inflate(r, 5.0), HOVER_BUTTON_BG, 5.0);
+        }
         list.glyph_quad(r, ts.icon_uv(icon), Rgba::WHITE, 0.0);
         ui.hitboxes.push(Hitbox { area: r, action, drag: None });
         ox += size + padding;
