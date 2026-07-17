@@ -107,6 +107,37 @@ impl Ui {
         self.refocus = true;
     }
 
+    /// Pan the camera just enough that `rect` (a freshly opened node) sits
+    /// inside the safe area below the toolbar, with a margin; no-op when it
+    /// is already fully visible. Explicit focus actions still use
+    /// focus_to_rect's full centering — this is the calm variant for
+    /// automatic movement.
+    pub fn ensure_visible(&mut self, rect: Rect, window: Point) {
+        const MARGIN: f32 = 12.0;
+        // Include the close button hanging 25px above the box.
+        let rect = Rect { min: Point::new(rect.min.x, rect.min.y - 30.0), max: rect.max };
+        // If a lerp is already in flight, judge visibility against where the
+        // camera is headed, not where it currently is.
+        let base = if self.refocus { self.camera_target } else { self.camera };
+        let vmin = base.add(Point::new(MARGIN, TOOLBAR_H + MARGIN));
+        let vmax = base.add(Point::new(window.x - MARGIN, window.y - MARGIN));
+        let axis = |min: f32, max: f32, vmin: f32, vmax: f32| -> f32 {
+            if max - min > vmax - vmin || min < vmin {
+                min - vmin // doesn't fit, or sticks out top/left: align start
+            } else if max > vmax {
+                max - vmax
+            } else {
+                0.0
+            }
+        };
+        let dx = axis(rect.min.x, rect.max.x, vmin.x, vmax.x);
+        let dy = axis(rect.min.y, rect.max.y, vmin.y, vmax.y);
+        if dx != 0.0 || dy != 0.0 {
+            self.camera_target = base.add(Point::new(dx, dy));
+            self.refocus = true;
+        }
+    }
+
     /// Advance the camera lerp; returns true while animating.
     pub fn step_camera(&mut self, dt: f32) -> bool {
         if !self.refocus {

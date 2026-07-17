@@ -750,8 +750,10 @@ fn apply_task_result(
                     let window = Point::new(lw as f32, lh as f32);
                     model::calc_size(arena, child_id, ts, ui::node_max_size(window));
                     if let Some(c) = arena.get(child_id) {
+                        // Calm auto-focus: only pan if the new node spawned
+                        // outside the visible area.
                         let r = c.rect;
-                        ui.focus_to_rect(r, window);
+                        ui.ensure_visible(r, window);
                     }
                 }
                 Err(e) => {
