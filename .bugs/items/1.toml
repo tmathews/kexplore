@@ -1,0 +1,17 @@
+id = 1
+kind = "todo"
+title = "Scan spinner forces full-frame redraw + blur every vsync"
+description = """
+The app is event-gated (renders only when dirty || animating, blocks in poll when idle — main.rs:354, main.rs:139) and uses FIFO/vsync present, so idle costs zero GPU work. But there is NO dirty-region system: every rendered frame is a full-viewport clear-and-repaint (both passes loadOp CLEAR at full extent — mod.rs:394, mod.rs:434; scissor always full — renderer2d.rs:600; geometry rebuilt immediate-mode — main.rs:356; toolbar blur re-run unconditionally — mod.rs:420).
+
+The one real battery sink: the directory-scan busy spinner (ui.rs:506) sets animating=true, which flips the poll timeout to 0 (main.rs:137) and drives a full-frame redraw PLUS the full toolbar blur pass every vsync for the entire duration of a background scan — all to rotate one small glyph. Camera-pan lerps do the same but are sub-second and harmless.
+
+Proposed cheap fix (not a full damage-rectangle system, which is high-effort/low-value since idle already does zero work):
+  1. Throttle the spinner animation off the vsync cadence — cap the poll timeout to a ~20fps spinner tick instead of 0 while the only reason for animating is the spinner.
+  2. Skip the blur pass when the toolbar band content is unchanged (add a 'blur dirty' flag; reuse last blur_b).
+
+Found during a GPU/battery drawing investigation on 2026-07-17."""
+author = "Claude Opus 4.8 (agent) <agent@bug-catcher>"
+state = "open"
+created_at = "2026-07-17T20:38:17.479123698Z"
+updated_at = "2026-07-17T20:38:17.482677735Z"

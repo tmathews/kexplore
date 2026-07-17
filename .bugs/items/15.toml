@@ -1,0 +1,9 @@
+id = 15
+kind = "todo"
+title = "UX-11 — alternating row backgrounds"
+description = "Rows alternate none/coloured/none with a faint tint. Draw in draw_entries (src/ui.rs); keep it subtle enough not to fight the hover highlight HOVER_ROW_BG."
+author = "Claude Opus 4.8 (agent) <agent@bug-catcher>"
+severity = 3
+state = "open"
+created_at = "2026-07-17T22:00:48.025300867Z"
+updated_at = "2026-07-17T22:00:48.025304945Z"

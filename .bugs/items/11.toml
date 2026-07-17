@@ -1,0 +1,8 @@
+id = 11
+kind = "todo"
+title = "Ability to search favorites in URL bar"
+description = ""
+author = "Thomas Mathews <thomas.c.mathews@gmail.com>"
+state = "open"
+created_at = "2026-07-17T21:52:05.209968324Z"
+updated_at = "2026-07-17T21:52:08.453632487Z"

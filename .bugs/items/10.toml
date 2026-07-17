@@ -1,0 +1,8 @@
+id = 10
+kind = "todo"
+title = "Ability to mark directory as favorite"
+description = ""
+author = "Thomas Mathews <thomas.c.mathews@gmail.com>"
+state = "open"
+created_at = "2026-07-17T21:51:12.288020008Z"
+updated_at = "2026-07-17T21:52:09.272974584Z"

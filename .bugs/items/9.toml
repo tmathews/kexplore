@@ -1,0 +1,8 @@
+id = 9
+kind = "todo"
+title = "Autocomplete suggestions in URL bar"
+description = "Autocomplete suggestions should show up in a popup window below as you type. Pressing navigation arrows or tab will go down the list. Pressing tab or enter will complete it."
+author = "Thomas Mathews <thomas.c.mathews@gmail.com>"
+state = "open"
+created_at = "2026-07-17T21:50:38.914043215Z"
+updated_at = "2026-07-17T21:51:58.739767897Z"

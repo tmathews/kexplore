@@ -1,0 +1,10 @@
+id = 18
+kind = "todo"
+title = "UX-5 — node collision"
+description = "Nodes never land on top of each other. A freshly opened node slides straight down past whatever it would overlap; a dropped node snaps to the nearest free spot in any direction. Both keep a 12px NODE_GAP and glide into place (Node.anim_to + model::step_nodes, same lerp as the camera). Resolver: model::resolve_collision (unit-tested in src/model.rs); wired at the spawn site (main.rs apply_task_result) and drag-release (ui.rs process_input). Design: move the newcomer (not existing nodes) on open; snap-on-release for drags; animated. Verified live in nested niri + 6 unit tests. Uncommitted on main as of 2026-07-17."
+author = "Claude Opus 4.8 (agent) <agent@bug-catcher>"
+severity = 2
+state = "closed"
+resolution = "done"
+created_at = "2026-07-17T22:00:48.034346414Z"
+updated_at = "2026-07-17T22:00:59.151119526Z"

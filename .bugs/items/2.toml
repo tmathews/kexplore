@@ -1,0 +1,8 @@
+id = 2
+kind = "todo"
+title = "Remove dependency on wl-copy & wl-paste."
+description = "We shouldn't hardcode these in, instead we should see if there is a wayland protocol we can follow."
+author = "Thomas Mathews <thomas.c.mathews@gmail.com>"
+state = "open"
+created_at = "2026-07-17T20:44:34.247175136Z"
+updated_at = "2026-07-17T21:21:34.135758219Z"
