@@ -27,7 +27,9 @@ Mouse only, like the C app:
   `wl-copy`/`wl-paste`); Esc or clicking away cancels back to showing the
   selection. Long paths scroll and clip inside the field.
 - **Click a directory row** — open it as a new node (scanned on a worker
-  thread; spinner shows while it loads).
+  thread; spinner shows while it loads). A node box never exceeds 90% of
+  the viewing area below the toolbar; bigger directories scroll inside the
+  box with the mouse wheel (scrollbar shows the position).
 - **Click a file row** — select it; PNG/JPEG/WebP get a preview bottom-right;
   an open button appears next to the row for files with a configured handler.
 - **Drag a node** — move it. **Drag empty canvas** — pan the camera.

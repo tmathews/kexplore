@@ -23,8 +23,14 @@ pub struct Node {
     pub items: Vec<Item>,
     /// Owning node and the index of the item we hang off of.
     pub parent: Option<(NodeId, usize)>,
-    /// Canvas position; Rect::ZERO means not laid out yet.
+    /// Canvas position of the displayed box (size capped to the viewport
+    /// limit); Rect::ZERO means not laid out yet.
     pub rect: Rect,
+    /// Full (uncapped) content size from layout.
+    pub content_w: f32,
+    pub content_h: f32,
+    /// Vertical scroll offset when content_h exceeds the box height.
+    pub scroll: f32,
 }
 
 pub struct Item {
@@ -152,12 +158,22 @@ pub fn node_from_items(path: PathBuf, data: Vec<ItemData>) -> Node {
             scanning: false,
         })
         .collect();
-    Node { path, items, parent: None, rect: Rect::ZERO }
+    Node {
+        path,
+        items,
+        parent: None,
+        rect: Rect::ZERO,
+        content_w: 0.0,
+        content_h: 0.0,
+        scroll: 0.0,
+    }
 }
 
 /// Port of node_calc_size: stack rows vertically with 5px padding, size the
 /// box to the widest row, and position it to the right of the parent item.
-pub fn calc_size(arena: &mut NodeArena, id: NodeId, ts: &mut TextSystem) {
+/// The displayed box is capped to `max_size` (90% of the safe viewing area);
+/// overflowing content scrolls inside the box.
+pub fn calc_size(arena: &mut NodeArena, id: NodeId, ts: &mut TextSystem, max_size: Point) {
     const PADDING: f32 = 5.0;
     let Some(node) = arena.get(id) else { return };
     let lh = ts.line_height();
@@ -187,5 +203,10 @@ pub fn calc_size(arena: &mut NodeArena, id: NodeId, ts: &mut TextSystem) {
     for (item, r) in node.items.iter_mut().zip(rects) {
         item.rect = r;
     }
-    node.rect = Rect { min: origin, max: Point::new(origin.x + max_w + 2.0 * PADDING, origin.y + oy + PADDING) };
+    node.content_w = max_w + 2.0 * PADDING;
+    node.content_h = oy + PADDING;
+    node.scroll = 0.0;
+    let box_w = node.content_w.min(max_size.x);
+    let box_h = node.content_h.min(max_size.y);
+    node.rect = Rect { min: origin, max: Point::new(origin.x + box_w, origin.y + box_h) };
 }

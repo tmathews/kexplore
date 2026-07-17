@@ -289,6 +289,7 @@ impl TextSystem {
 
     /// Draw text with its top-left corner at `origin` (logical px), like the
     /// Pango draw_text2 did. Returns the advance width in logical px.
+    #[allow(dead_code)]
     pub fn draw(&mut self, list: &mut DrawList, origin: Point, s: &str, color: Rgba) -> f32 {
         self.draw_impl(list, origin, s, color, None)
     }

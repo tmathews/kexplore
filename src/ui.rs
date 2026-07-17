@@ -16,6 +16,12 @@ pub const TOOLBAR_H: f32 = 62.0;
 /// Horizontal inset from the URL bar border to its text.
 pub const URL_PAD: f32 = 10.0;
 
+/// The largest box a node may occupy: 90% of the safe viewing area (the
+/// window minus the toolbar band).
+pub fn node_max_size(window: Point) -> Point {
+    Point::new(window.x * 0.9, (window.y - TOOLBAR_H).max(1.0) * 0.9)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
     /// Dead surface that swallows clicks (toolbar background).
@@ -131,6 +137,20 @@ impl Ui {
             .find(|hb| hb.area.contains(cursor))
             .copied();
 
+        // Mouse wheel over a node scrolls its content.
+        let wheel = pointer.scroll_delta as f32;
+        if wheel != 0.0 {
+            if let Some(id) = hit.and_then(|h| h.drag) {
+                if let Some(node) = arena.get_mut(id) {
+                    let max_scroll = (node.content_h - node.rect.height()).max(0.0);
+                    if max_scroll > 0.0 {
+                        node.scroll = (node.scroll + wheel * 3.0).clamp(0.0, max_scroll);
+                        dirty = true;
+                    }
+                }
+            }
+        }
+
         if pointer.pressed {
             self.drag = DragState::Pending { origin: cursor, node: hit.and_then(|h| h.drag) };
         }
@@ -238,9 +258,18 @@ fn draw_entries(
     out: &mut FrameOut,
 ) {
     let off = Point::new(-camera.min.x, -camera.min.y);
-    let Some(node) = arena.get(id) else { return };
-    let node_rect = node.rect;
-    let is_root = node.parent.is_none();
+    let cap = node_max_size(camera.size());
+
+    // Re-clamp the box and scroll every frame so window resizes keep the
+    // 90% rule without a relayout.
+    let (node_rect, scroll, content_h, is_root) = {
+        let Some(node) = arena.get_mut(id) else { return };
+        let box_w = node.content_w.min(cap.x);
+        let box_h = node.content_h.min(cap.y);
+        node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
+        node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
+        (node.rect, node.scroll, node.content_h, node.parent.is_none())
+    };
 
     if camera.intersects(node_rect) {
         let screen_rect = node_rect.offset(off);
@@ -260,18 +289,29 @@ fn draw_entries(
         }
     }
 
+    // Rows draw shifted by the scroll offset and clip to the box interior.
+    let content_clip = Rect {
+        min: Point::new(node_rect.min.x, node_rect.min.y + 2.0),
+        max: Point::new(node_rect.max.x, node_rect.max.y - 2.0),
+    };
+    let scrolled = content_h > node_rect.height() + 0.5;
+
     let item_count = arena.get(id).map(|n| n.items.len()).unwrap_or(0);
     for i in 0..item_count {
         let Some(node) = arena.get(id) else { return };
         let item = &node.items[i];
-        let rect = item.rect.offset(node_rect.min); // world
+        let rect = item.rect.offset(node_rect.min).offset(Point::new(0.0, -scroll)); // world
         let screen_rect = rect.offset(off);
-        let in_view = camera.intersects(rect);
+        let row_in_box = rect.max.y > content_clip.min.y && rect.min.y < content_clip.max.y;
+        let in_view = camera.intersects(rect) && row_in_box;
         let selected = ui.selection == Some((id, i));
         let child = item.child;
         let is_dir = item.is_dir;
         let scanning = item.scanning;
         let display = item.display.clone();
+        // Side attachments (open button, spinner) hang off the box edge when
+        // the row text is wider than the capped box.
+        let side_x = rect.max.x.min(node_rect.max.x).max(node_rect.min.x) - camera.min.x;
 
         if in_view {
             let color = if selected {
@@ -281,14 +321,16 @@ fn draw_entries(
             } else {
                 Rgba::WHITE
             };
-            ts.draw(list, screen_rect.min, &display, color);
-            ui.hitboxes.push(Hitbox {
-                area: screen_rect,
-                action: Action::Row { node: id, item: i },
-                drag: Some(id),
-            });
+            ts.draw_clipped(list, screen_rect.min, &display, color, content_clip.offset(off));
+            if let Some(hb) = screen_rect.intersect(content_clip.offset(off)) {
+                ui.hitboxes.push(Hitbox {
+                    area: hb,
+                    action: Action::Row { node: id, item: i },
+                    drag: Some(id),
+                });
+            }
             if selected && !is_dir {
-                let r = Rect::from_xywh(screen_rect.max.x + 10.0, screen_rect.min.y + 4.0, 20.0, 20.0);
+                let r = Rect::from_xywh(side_x + 10.0, screen_rect.min.y + 4.0, 20.0, 20.0);
                 list.glyph_quad(r, ts.icon_uv(Icon::Open), Rgba::WHITE, 0.0);
                 ui.hitboxes.push(Hitbox {
                     area: r,
@@ -301,20 +343,38 @@ fn draw_entries(
         if scanning {
             // Busy spinner beside the row (the C app intended this but its
             // busy.svg never existed).
-            let r = Rect::from_xywh(screen_rect.max.x + 10.0, screen_rect.min.y + 2.0, 16.0, 16.0);
-            list.glyph_quad(r, ts.icon_uv(Icon::Busy), Rgba::WHITE, spin_angle);
+            if in_view {
+                let r = Rect::from_xywh(side_x + 10.0, screen_rect.min.y + 2.0, 16.0, 16.0);
+                list.glyph_quad(r, ts.icon_uv(Icon::Busy), Rgba::WHITE, spin_angle);
+            }
             out.animating = true;
         } else if let Some(child_id) = child {
             draw_entries(ui, arena, child_id, ts, list, camera, spin_angle, out);
             if let Some(child_node) = arena.get(child_id) {
+                // Anchor at the row's center, clamped to the box edge when
+                // the row is scrolled out of view.
+                let anchor_y = (rect.min.y + rect.height() / 2.0)
+                    .clamp(node_rect.min.y + 5.0, node_rect.max.y - 5.0);
                 list.line(
-                    Point::new(node_rect.max.x, rect.min.y + rect.height() / 2.0).add(off),
+                    Point::new(node_rect.max.x, anchor_y).add(off),
                     Point::new(child_node.rect.min.x, child_node.rect.min.y + 5.0).add(off),
                     3.0,
                     Rgba::WHITE,
                 );
             }
         }
+    }
+
+    // Scrollbar indicator on the right edge while content overflows.
+    if scrolled && camera.intersects(node_rect) {
+        let box_h = node_rect.height();
+        let track_h = box_h - 8.0;
+        let thumb_h = (track_h * box_h / content_h).max(20.0);
+        let max_scroll = content_h - box_h;
+        let t = if max_scroll > 0.0 { scroll / max_scroll } else { 0.0 };
+        let thumb_y = node_rect.min.y + 4.0 + t * (track_h - thumb_h);
+        let thumb = Rect::from_xywh(node_rect.max.x - 6.0, thumb_y, 3.0, thumb_h).offset(off);
+        list.rect(thumb, Rgba::new(1.0, 1.0, 1.0, 0.35), 1.5);
     }
 }
 

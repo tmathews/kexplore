@@ -34,6 +34,9 @@ pub struct PointerState {
     pub is_down: bool,
     pub pressed: bool,
     pub released: bool,
+    /// Accumulated vertical wheel/scroll motion this iteration (logical px,
+    /// positive = scroll down).
+    pub scroll_delta: f64,
 }
 
 /// A resolved key press (or repeat) ready for the UI to consume.
@@ -230,6 +233,7 @@ impl Platform {
     pub fn end_input_frame(&mut self) {
         self.pointer_state.pressed = false;
         self.pointer_state.released = false;
+        self.pointer_state.scroll_delta = 0.0;
     }
 
     /// When the next key repeat is due, if a repeating key is held.
@@ -557,6 +561,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Platform {
                         _ => {}
                     }
                 }
+            }
+            wl_pointer::Event::Axis { axis: WEnum::Value(wl_pointer::Axis::VerticalScroll), value, .. } => {
+                state.pointer_state.scroll_delta += value;
             }
             wl_pointer::Event::Leave { .. } => {
                 state.pointer_state.is_down = false;

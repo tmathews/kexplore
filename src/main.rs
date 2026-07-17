@@ -104,7 +104,7 @@ fn main() {
         std::process::exit(1);
     });
     let mut root = arena.insert(model::node_from_items(home, root_items));
-    model::calc_size(&mut arena, root, &mut ts);
+    model::calc_size(&mut arena, root, &mut ts, ui::node_max_size(Point::new(600.0, 440.0)));
 
     let mut ui = Ui::new();
     if let Some(node) = arena.get(root) {
@@ -516,7 +516,7 @@ fn reroot(
         Ok(data) => {
             arena.close_recursive(*root);
             *root = arena.insert(model::node_from_items(path.clone(), data));
-            model::calc_size(arena, *root, ts);
+            model::calc_size(arena, *root, ts, ui::node_max_size(window));
             ui.selection = None;
             ui.selected_path = Some(path);
             if let Some(n) = arena.get(*root) {
@@ -641,7 +641,10 @@ fn handle_action(
             if let Some((node, item)) = ui.selection {
                 if let Some(n) = arena.get(node) {
                     if let Some(it) = n.items.get(item) {
-                        let r = it.rect.offset(n.rect.min);
+                        let r = it
+                            .rect
+                            .offset(n.rect.min)
+                            .offset(Point::new(0.0, -n.scroll));
                         ui.focus_to_rect(r, window);
                     }
                 }
@@ -655,7 +658,10 @@ fn handle_action(
                 if let Some((pid, pidx)) = n.parent {
                     if let Some(p) = arena.get(pid) {
                         if let Some(pit) = p.items.get(pidx) {
-                            let r = pit.rect.offset(p.rect.min);
+                            let r = pit
+                                .rect
+                                .offset(p.rect.min)
+                                .offset(Point::new(0.0, -p.scroll));
                             ui.focus_to_rect(r, window);
                         }
                     }
@@ -740,11 +746,12 @@ fn apply_task_result(
                     if let Some(n) = arena.get_mut(node) {
                         n.items[item].child = Some(child_id);
                     }
-                    model::calc_size(arena, child_id, ts);
+                    let (lw, lh) = platform.logical_size;
+                    let window = Point::new(lw as f32, lh as f32);
+                    model::calc_size(arena, child_id, ts, ui::node_max_size(window));
                     if let Some(c) = arena.get(child_id) {
                         let r = c.rect;
-                        let (lw, lh) = platform.logical_size;
-                        ui.focus_to_rect(r, Point::new(lw as f32, lh as f32));
+                        ui.focus_to_rect(r, window);
                     }
                 }
                 Err(e) => {

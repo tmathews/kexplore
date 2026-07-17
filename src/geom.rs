@@ -41,6 +41,10 @@ impl Rect {
         Rect { min: Point::new(x, y), max: Point::new(x + w, y + h) }
     }
 
+    pub fn size(self) -> Point {
+        self.max.sub(self.min)
+    }
+
     pub fn width(self) -> f32 {
         self.max.x - self.min.x
     }
