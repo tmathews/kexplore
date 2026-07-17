@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::geom::{Point, Rect};
 use crate::text::TextSystem;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId {
     index: u32,
     gen: u32,

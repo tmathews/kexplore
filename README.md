@@ -26,12 +26,15 @@ Mouse only, like the C app:
   jumps), Shift-selection, Home/End, Ctrl+A/C/X/V (clipboard via
   `wl-copy`/`wl-paste`); Esc or clicking away cancels back to showing the
   selection. Long paths scroll and clip inside the field.
-- **Click a directory row** — open it as a new node (scanned on a worker
-  thread; spinner shows while it loads). A node box never exceeds 90% of
-  the viewing area below the toolbar; bigger directories scroll inside the
-  box with the mouse wheel (scrollbar shows the position). The camera only
-  pans when a new node spawns outside the view, and then just enough to
-  bring it in; use the toolbar focus buttons for explicit centering.
+- **Click a directory row** — selects it (the URL bar shows its path and
+  the nodes forming that route get an amber border). **Double-click** opens
+  it as a new node (scanned on a worker thread; spinner shows while it
+  loads). A node box never exceeds 90% of the viewing area below the
+  toolbar; bigger directories scroll inside the box with the mouse wheel
+  (scrollbar shows the position). The camera only pans when a new node
+  spawns outside the view, and then just enough to bring it in; use the
+  toolbar focus buttons for explicit centering. Connector lines between a
+  parent row and its child node always pass beneath the node boxes.
 - **Click a file row** — select it; PNG/JPEG/WebP get a preview bottom-right;
   an open button appears next to the row for files with a configured handler.
 - **Drag a node** — move it. **Drag empty canvas** — pan the camera.

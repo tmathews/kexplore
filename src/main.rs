@@ -293,7 +293,7 @@ fn main() {
         let (action, input_dirty) = ui.process_input(&mut arena, &platform.pointer_state);
         dirty |= input_dirty;
         platform.end_input_frame();
-        if let Some(action) = action {
+        if let Some((action, double)) = action {
             if matches!(action, Action::UrlBar) {
                 // Focus the field (seeding it with the selected path) and
                 // put the caret at the click position.
@@ -314,6 +314,7 @@ fn main() {
             } else {
                 let clear_preview = handle_action(
                     action,
+                    double,
                     &mut arena,
                     &mut ui,
                     &tasks,
@@ -588,6 +589,7 @@ fn make_preview_texture(
 #[allow(clippy::too_many_arguments)]
 fn handle_action(
     action: Action,
+    double: bool,
     arena: &mut NodeArena,
     ui: &mut Ui,
     tasks: &Tasks,
@@ -605,7 +607,8 @@ fn handle_action(
             let path = n.path.join(&it.name);
             ui.selected_path = Some(path.clone());
             let is_dir = it.is_dir;
-            let can_scan = is_dir && it.child.is_none() && !it.scanning;
+            // Directories open on double click; a single click only selects.
+            let can_scan = double && is_dir && it.child.is_none() && !it.scanning;
             // Any selection change invalidates in-flight preview decodes.
             if !is_dir && preview::previewable(&path) {
                 preview.request(path.clone());

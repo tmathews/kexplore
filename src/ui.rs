@@ -3,6 +3,7 @@
 //! previous frame's hitboxes (same one-frame latency as the C app) and
 //! returns a typed Action instead of the C trigger/type magic ints.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::geom::{Point, Rect};
@@ -71,6 +72,8 @@ pub struct Ui {
     pub last_pointer: Point,
     /// What the pointer is over (from the previous frame's hitboxes).
     pub hover: Option<Action>,
+    /// Previous click for double-click detection.
+    last_click: Option<(Action, std::time::Instant)>,
 }
 
 /// Camera lerp: C used a fixed 0.16 per frame at ~60Hz; this is the
@@ -91,6 +94,7 @@ impl Ui {
             url_bar_rect: Rect::ZERO,
             last_pointer: Point::ZERO,
             hover: None,
+            last_click: None,
         }
     }
 
@@ -156,12 +160,13 @@ impl Ui {
     }
 
     /// Hit-test, drag handling, and click dispatch. Returns the clicked
-    /// action (if any) and whether the frame is dirty from input.
+    /// action with a double-click flag (if any) and whether the frame is
+    /// dirty from input.
     pub fn process_input(
         &mut self,
         arena: &mut NodeArena,
         pointer: &PointerState,
-    ) -> (Option<Action>, bool) {
+    ) -> (Option<(Action, bool)>, bool) {
         let mut dirty = false;
         let cursor = Point::new(pointer.x as f32, pointer.y as f32);
         let hit = self
@@ -231,7 +236,21 @@ impl Ui {
         let mut action = None;
         if pointer.released {
             if let DragState::Pending { .. } = self.drag {
-                action = hit.map(|h| h.action);
+                if let Some(h) = hit {
+                    let now = std::time::Instant::now();
+                    let double = self
+                        .last_click
+                        .take()
+                        .is_some_and(|(a, t)| a == h.action && now.duration_since(t).as_millis() < DOUBLE_CLICK_MS);
+                    // A consumed double doesn't seed the next one (a triple
+                    // click is not two doubles).
+                    if !double {
+                        self.last_click = Some((h.action, now));
+                    }
+                    action = Some((h.action, double));
+                } else {
+                    self.last_click = None;
+                }
             }
             if !matches!(self.drag, DragState::None) {
                 self.drag = DragState::None;
@@ -248,6 +267,11 @@ const COLOR_ROW_SELECTED: Rgba = Rgba([255, 0, 0, 255]);
 const COLOR_ROW_OPEN: Rgba = Rgba([0, 255, 0, 255]);
 const HOVER_ROW_BG: Rgba = Rgba([255, 255, 255, 26]); // white 0.10
 const HOVER_BUTTON_BG: Rgba = Rgba([255, 255, 255, 38]); // white 0.15
+/// Border for nodes on the chain from root to the current selection.
+const COLOR_PATH_BORDER: Rgba = Rgba([255, 191, 64, 255]);
+
+/// Two clicks on the same target within this window count as a double click.
+const DOUBLE_CLICK_MS: u128 = 400;
 
 fn inflate(r: Rect, by: f32) -> Rect {
     Rect { min: Point::new(r.min.x - by, r.min.y - by), max: Point::new(r.max.x + by, r.max.y + by) }
@@ -278,10 +302,79 @@ pub fn build_frame(
     ui.hitboxes.clear();
     let mut out = FrameOut { animating: false };
     let camera = Rect { min: ui.camera, max: ui.camera.add(window) };
-    draw_entries(ui, arena, root, ts, canvas, camera, spin_angle, &mut out);
+    let cap = node_max_size(window);
+    let path = path_nodes(arena, ui.selection);
+    // Connectors are emitted first so every node box paints over them — the
+    // lines pass *under* the nodes rather than across their content.
+    draw_connectors(arena, root, canvas, camera, cap);
+    draw_entries(ui, arena, root, ts, canvas, camera, spin_angle, &path, &mut out);
     draw_preview(canvas, window, preview);
     draw_navigation(ui, ts, overlay, window, caret_visible);
     out
+}
+
+/// The set of nodes forming the route shown in the URL bar: the node holding
+/// the selection, all of its ancestors, and the opened child of the selected
+/// item (whose path equals the URL when the selection is an open directory).
+fn path_nodes(arena: &NodeArena, selection: Option<(NodeId, usize)>) -> HashSet<NodeId> {
+    let mut set = HashSet::new();
+    let Some((node, item)) = selection else { return set };
+    if let Some(n) = arena.get(node) {
+        if let Some(child) = n.items.get(item).and_then(|it| it.child) {
+            set.insert(child);
+        }
+    }
+    let mut cur = Some(node);
+    while let Some(id) = cur {
+        set.insert(id);
+        cur = arena.get(id).and_then(|n| n.parent.map(|(p, _)| p));
+    }
+    set
+}
+
+/// Re-clamp every node and emit the parent→child connector lines. Kept
+/// separate from `draw_entries` so all lines land in the draw list before any
+/// box, guaranteeing they render beneath the nodes.
+fn draw_connectors(
+    arena: &mut NodeArena,
+    id: NodeId,
+    list: &mut DrawList,
+    camera: Rect,
+    cap: Point,
+) {
+    let off = Point::new(-camera.min.x, -camera.min.y);
+    let (node_rect, scroll) = {
+        let Some(node) = arena.get_mut(id) else { return };
+        let box_w = node.content_w.min(cap.x);
+        let box_h = node.content_h.min(cap.y);
+        node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
+        node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
+        (node.rect, node.scroll)
+    };
+    let item_count = arena.get(id).map(|n| n.items.len()).unwrap_or(0);
+    for i in 0..item_count {
+        let Some(node) = arena.get(id) else { return };
+        let item = &node.items[i];
+        let Some(child_id) = item.child else { continue };
+        let item_rect = item.rect;
+        let rect = item_rect.offset(node_rect.min).offset(Point::new(0.0, -scroll));
+        // Anchor at the row center, clamped to the box edge when the row is
+        // scrolled out of view.
+        let anchor_y =
+            (rect.min.y + rect.height() / 2.0).clamp(node_rect.min.y + 5.0, node_rect.max.y - 5.0);
+        if let Some(child_node) = arena.get(child_id) {
+            let a = Point::new(node_rect.max.x, anchor_y);
+            let b = Point::new(child_node.rect.min.x, child_node.rect.min.y + 5.0);
+            let seg = Rect {
+                min: Point::new(a.x.min(b.x), a.y.min(b.y)),
+                max: Point::new(a.x.max(b.x), a.y.max(b.y)),
+            };
+            if camera.intersects(seg) {
+                list.line(a.add(off), b.add(off), 3.0, Rgba::WHITE);
+            }
+        }
+        draw_connectors(arena, child_id, list, camera, cap);
+    }
 }
 
 /// Port of draw_preview: scaled to 400 wide (upscaling small images too,
@@ -299,6 +392,7 @@ fn draw_preview(list: &mut DrawList, window: Point, preview: Option<(u32, u32)>)
     list.rect_stroke(r, Rgba::WHITE, 0.0, 1.0);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_entries(
     ui: &mut Ui,
     arena: &mut NodeArena,
@@ -307,6 +401,7 @@ fn draw_entries(
     list: &mut DrawList,
     camera: Rect,
     spin_angle: f32,
+    path: &HashSet<NodeId>,
     out: &mut FrameOut,
 ) {
     let off = Point::new(-camera.min.x, -camera.min.y);
@@ -326,7 +421,8 @@ fn draw_entries(
     if camera.intersects(node_rect) {
         let screen_rect = node_rect.offset(off);
         list.rect(screen_rect, COLOR_BOX_FILL, 5.0);
-        list.rect_stroke(screen_rect, Rgba::WHITE, 5.0, 3.0);
+        let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
+        list.rect_stroke(screen_rect, border, 5.0, 3.0);
         ui.hitboxes.push(Hitbox { area: screen_rect, action: Action::NodeBody, drag: Some(id) });
         if !is_root {
             // Close button: node.min + (2, -25), 20x20, like draw_entries.
@@ -409,19 +505,9 @@ fn draw_entries(
             }
             out.animating = true;
         } else if let Some(child_id) = child {
-            draw_entries(ui, arena, child_id, ts, list, camera, spin_angle, out);
-            if let Some(child_node) = arena.get(child_id) {
-                // Anchor at the row's center, clamped to the box edge when
-                // the row is scrolled out of view.
-                let anchor_y = (rect.min.y + rect.height() / 2.0)
-                    .clamp(node_rect.min.y + 5.0, node_rect.max.y - 5.0);
-                list.line(
-                    Point::new(node_rect.max.x, anchor_y).add(off),
-                    Point::new(child_node.rect.min.x, child_node.rect.min.y + 5.0).add(off),
-                    3.0,
-                    Rgba::WHITE,
-                );
-            }
+            // Connector lines were emitted by draw_connectors (under all
+            // boxes); here we only recurse to draw the child subtree.
+            draw_entries(ui, arena, child_id, ts, list, camera, spin_angle, path, out);
         }
     }
 
