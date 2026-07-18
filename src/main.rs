@@ -136,6 +136,9 @@ fn main() {
             std::process::exit(1);
         });
     let atlas_set = renderer.register_texture(&gfx.device, &ts.texture).expect("atlas set");
+    // The icon atlas is re-uploaded (not recreated) on scale change, so this
+    // descriptor set stays valid for the app's lifetime.
+    let icon_set = renderer.register_texture(&gfx.device, &ts.icon_texture).expect("icon set");
     let mut scene_set = renderer.register_texture(&gfx.device, &gfx.blur.scene).expect("scene set");
     let mut blur_set = renderer.register_texture(&gfx.device, &gfx.blur.blur_b).expect("blur set");
 
@@ -527,6 +530,7 @@ fn main() {
                 previews: &prev_table,
                 scene: Some(scene_set),
                 blur: Some(blur_set),
+                icons: Some(icon_set),
             };
             let mut recorded = false;
             let mut offsets: Vec<u32> = Vec::new();

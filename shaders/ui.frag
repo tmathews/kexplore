@@ -20,6 +20,7 @@ const uint MODE_RRECT_BORDER = 2u;
 const uint MODE_GLYPH = 3u;
 const uint MODE_IMAGE = 4u;
 const uint MODE_IMAGE_RRECT = 5u;
+const uint MODE_ICON = 6u;
 
 // Signed distance to a rounded rect centered at origin.
 float rrect_sd(vec2 p, vec2 half_size, float radius) {
@@ -39,6 +40,11 @@ void main() {
         c.a *= textureLod(tex, v_uv, 0.0).r;
     } else if (v_mode == MODE_IMAGE) {
         out_color = textureLod(tex, v_uv, 0.0); // uploaded premultiplied
+        return;
+    } else if (v_mode == MODE_ICON) {
+        // Premultiplied icon texel times the (straight) tint, premultiplied.
+        vec4 t = textureLod(tex, v_uv, 0.0);
+        out_color = t * vec4(c.rgb * c.a, c.a);
         return;
     } else if (v_mode == MODE_IMAGE_RRECT) {
         // Full-screen texture (UV from screen position) through a rounded mask.

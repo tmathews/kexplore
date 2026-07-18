@@ -850,7 +850,7 @@ fn draw_header(
     // Type icon, left, vertically centered.
     let iy = node_rect.min.y + (HEADER_H - HEADER_ICON) * 0.5;
     let ir = view.w2s_rect(Rect::from_xywh(node_rect.min.x + HEADER_PAD, iy, HEADER_ICON, HEADER_ICON));
-    list.glyph_quad(ir, ts.icon_uv(type_icon), Rgba::new(1.0, 1.0, 1.0, 0.85), 0.0);
+    list.icon_quad(ir, ts.icon_uv(type_icon), Rgba::new(1.0, 1.0, 1.0, 0.85), 0.0);
     // Action buttons, right to left: the primary button (close/pin), then star.
     let by = node_rect.min.y + (HEADER_H - HEADER_BTN) * 0.5;
     let mut bx = node_rect.max.x - HEADER_PAD - HEADER_BTN;
@@ -859,7 +859,7 @@ fn draw_header(
         if ui.hover == Some(action) {
             list.rect(inflate(r, 2.0), HOVER_BUTTON_BG, 4.0);
         }
-        list.glyph_quad(r, ts.icon_uv(icon), Rgba::WHITE, 0.0);
+        list.icon_quad(r, ts.icon_uv(icon), Rgba::WHITE, 0.0);
         ui.hitboxes.push(Hitbox { area: r, action, drag: DragKind::Node(id) });
         bx -= HEADER_BTN + HEADER_BTN_GAP;
     }
@@ -869,7 +869,7 @@ fn draw_header(
         list.rect(inflate(fr, 2.0), HOVER_BUTTON_BG, 4.0);
     }
     let star = if favorited { COLOR_FAVORITE } else { Rgba::new(1.0, 1.0, 1.0, 0.4) };
-    list.glyph_quad(fr, ts.icon_uv(Icon::Star), star, 0.0);
+    list.icon_quad(fr, ts.icon_uv(Icon::Star), star, 0.0);
     ui.hitboxes.push(Hitbox { area: fr, action: faction, drag: DragKind::Node(id) });
 }
 
@@ -1263,7 +1263,7 @@ fn draw_entries(
                     ROW_ICON,
                     ROW_ICON,
                 );
-                list.glyph_quad(view.w2s_rect(iw), ts.icon_uv(icon), color, 0.0);
+                list.icon_quad(view.w2s_rect(iw), ts.icon_uv(icon), color, 0.0);
             }
             let text_origin = view.w2s(Point::new(rect.min.x + ROW_ICON + ROW_ICON_GAP, rect.min.y));
             ts.draw_clipped(list, text_origin, &display, color, clip_screen, z);
@@ -1281,7 +1281,7 @@ fn draw_entries(
             // busy.svg never existed).
             if in_view {
                 let r = view.w2s_rect(Rect::from_xywh(side_x + 10.0, rect.min.y + 2.0, 16.0, 16.0));
-                list.glyph_quad(r, ts.icon_uv(Icon::Busy), Rgba::WHITE, spin_angle);
+                list.icon_quad(r, ts.icon_uv(Icon::Busy), Rgba::WHITE, spin_angle);
             }
             out.animating = true;
         } else if let Some(child_id) = child {
@@ -1355,7 +1355,7 @@ fn draw_navigation(
         if ui.hover == Some(action) {
             list.rect(inflate(r, 5.0), HOVER_BUTTON_BG, 5.0);
         }
-        list.glyph_quad(r, ts.icon_uv(icon), Rgba::WHITE, 0.0);
+        list.icon_quad(r, ts.icon_uv(icon), Rgba::WHITE, 0.0);
         ui.hitboxes.push(Hitbox { area: r, action, drag: DragKind::None });
         ox += size + padding;
     }

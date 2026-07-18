@@ -16,6 +16,10 @@ pub const MODE_IMAGE: u32 = 4;
 /// A full-screen texture sampled through a rounded-rect mask (via gl_FragCoord),
 /// for a rounded frosted backdrop with no inset gap.
 pub const MODE_IMAGE_RRECT: u32 = 5;
+/// An RGBA icon (premultiplied) multiplied by the vertex tint: a whitened
+/// monochrome icon takes the tint's colour; a colour icon (drawn white) keeps
+/// its own colours.
+pub const MODE_ICON: u32 = 6;
 
 /// Anti-aliasing margin added around SDF quads, in physical pixels.
 const AA_MARGIN: f32 = 1.0;
@@ -56,6 +60,8 @@ pub enum TexSlot {
     Scene,
     /// Blurred toolbar band.
     Blur,
+    /// RGBA icon atlas (SVG-rasterized).
+    Icons,
 }
 
 /// Descriptor sets for each slot a draw list may reference. Missing optional
@@ -67,6 +73,7 @@ pub struct TexSets<'a> {
     pub previews: &'a [vk::DescriptorSet],
     pub scene: Option<vk::DescriptorSet>,
     pub blur: Option<vk::DescriptorSet>,
+    pub icons: Option<vk::DescriptorSet>,
 }
 
 impl TexSets<'_> {
@@ -76,6 +83,7 @@ impl TexSets<'_> {
             TexSlot::Tex(i) => self.previews.get(i as usize).copied().unwrap_or(self.atlas),
             TexSlot::Scene => self.scene.unwrap_or(self.atlas),
             TexSlot::Blur => self.blur.unwrap_or(self.atlas),
+            TexSlot::Icons => self.icons.unwrap_or(self.atlas),
         }
     }
 }
@@ -214,10 +222,10 @@ impl DrawList {
         );
     }
 
-    /// Textured quad sampling the glyph atlas as an alpha mask, tinted with
-    /// `color`, optionally rotated around the rect center (for the spinner).
-    pub fn glyph_quad(&mut self, r: Rect, uv: [f32; 4], color: Rgba, rotation: f32) {
-        self.require_tex(TexSlot::Atlas);
+    /// Icon quad sampling the RGBA icon atlas, tinted by `color` (see
+    /// MODE_ICON). Same geometry/rotation as `glyph_quad`.
+    pub fn icon_quad(&mut self, r: Rect, uv: [f32; 4], color: Rgba, rotation: f32) {
+        self.require_tex(TexSlot::Icons);
         let s = self.scale;
         let c = r.center();
         let (cx, cy) = (c.x * s, c.y * s);
@@ -227,7 +235,7 @@ impl DrawList {
         let rot = |x: f32, y: f32| [cx + x * cos - y * sin, cy + x * sin + y * cos];
         let corners = [rot(-hw, -hh), rot(hw, -hh), rot(hw, hh), rot(-hw, hh)];
         let uvs = [[uv[0], uv[1]], [uv[2], uv[1]], [uv[2], uv[3]], [uv[0], uv[3]]];
-        self.push_quad(corners, uvs, color, MODE_GLYPH, [0.0; 4]);
+        self.push_quad(corners, uvs, color, MODE_ICON, [0.0; 4]);
     }
 
     /// Glyph quad in physical pixel coordinates (text rendering rounds

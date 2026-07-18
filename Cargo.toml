@@ -14,3 +14,4 @@ fontdue = "0.9"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 libc = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
+resvg = { version = "0.47.0", default-features = false }

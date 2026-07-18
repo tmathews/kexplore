@@ -1,13 +1,14 @@
-//! Text + icon atlas. fontdue rasterizes glyphs at 18 logical px times the
-//! current output scale into a shelf-packed R8 atlas; icons (pre-rasterized
-//! PNG alpha masks) and a procedural busy spinner live in the same atlas so
-//! the whole UI minus the preview samples one texture. Measurements are
-//! returned in logical pixels and are scale-independent (fontdue metrics are
-//! linear in px size).
+//! Text + icon atlases. fontdue rasterizes glyphs at 18 logical px times the
+//! current output scale into a shelf-packed R8 atlas (text). Icons are
+//! rasterized from SVG with resvg into a separate RGBA atlas (colour-capable,
+//! sampled via MODE_ICON) and re-rendered when the scale changes; the
+//! procedural busy spinner shares it. Measurements are returned in logical
+//! pixels and are scale-independent (fontdue metrics are linear in px size).
 
 use std::collections::HashMap;
 
 use ash::vk;
+use resvg::{tiny_skia, usvg};
 
 use crate::geom::Point;
 use crate::gfx::renderer2d::{DrawList, Rgba};
@@ -35,18 +36,25 @@ pub enum Icon {
     Pin,
 }
 
-const ICON_PNGS: [(&[u8], Icon); 10] = [
-    (include_bytes!("../assets/icons/home.png"), Icon::Home),
-    (include_bytes!("../assets/icons/close.png"), Icon::Close),
-    (include_bytes!("../assets/icons/selection.png"), Icon::Selection),
-    (include_bytes!("../assets/icons/parent.png"), Icon::Parent),
-    (include_bytes!("../assets/icons/copy.png"), Icon::Copy),
-    (include_bytes!("../assets/icons/terminal.png"), Icon::Terminal),
-    (include_bytes!("../assets/icons/folder.png"), Icon::Folder),
-    (include_bytes!("../assets/icons/file.png"), Icon::File),
-    (include_bytes!("../assets/icons/star.png"), Icon::Star),
-    (include_bytes!("../assets/icons/pin.png"), Icon::Pin),
+/// Icons are rasterized from SVG at runtime (resvg). The `bool` is `mono`:
+/// monochrome icons are whitened so the draw-time tint colours them (keeping
+/// the current look); a colour icon sets `false` and keeps its own colours.
+const ICON_SVGS: [(&[u8], Icon, bool); 10] = [
+    (include_bytes!("../data/home.svg"), Icon::Home, true),
+    (include_bytes!("../data/close.svg"), Icon::Close, true),
+    (include_bytes!("../data/selection.svg"), Icon::Selection, true),
+    (include_bytes!("../data/parent.svg"), Icon::Parent, true),
+    (include_bytes!("../data/copy.svg"), Icon::Copy, true),
+    (include_bytes!("../data/terminal.svg"), Icon::Terminal, true),
+    (include_bytes!("../data/folder.svg"), Icon::Folder, true),
+    (include_bytes!("../data/file.svg"), Icon::File, true),
+    (include_bytes!("../data/star.svg"), Icon::Star, true),
+    (include_bytes!("../data/pin.svg"), Icon::Pin, true),
 ];
+
+/// Logical px each icon SVG is rasterized at; icons draw downscaled from this,
+/// and it is re-rasterized when the output scale changes (crisp on any display).
+const ICON_RASTER: f32 = 48.0;
 
 #[derive(Clone, Copy)]
 struct GlyphInfo {
@@ -103,13 +111,18 @@ struct IconSource {
     icon: Icon,
     w: u32,
     h: u32,
-    alpha: Vec<u8>,
+    /// Premultiplied RGBA (whitened for monochrome icons).
+    rgba: Vec<u8>,
 }
 
 pub struct TextSystem {
     font: fontdue::Font,
+    /// R8 atlas for text glyphs.
     pub texture: Texture,
+    /// RGBA atlas for (colour-capable) icons, sampled via MODE_ICON.
+    pub icon_texture: Texture,
     packer: Packer,
+    icon_packer: Packer,
     glyphs: HashMap<char, Option<GlyphInfo>>,
     icon_sources: Vec<IconSource>,
     icon_uvs: HashMap<Icon, [f32; 4]>,
@@ -130,34 +143,41 @@ impl TextSystem {
             .map_err(|e| format!("load font: {e}"))?;
         let texture =
             upload::create_texture(device, mem_props, ATLAS_SIZE, ATLAS_SIZE, vk::Format::R8_UNORM)?;
-
-        let mut icon_sources = Vec::new();
-        for (bytes, icon) in ICON_PNGS {
-            let img = image::load_from_memory(bytes)
-                .map_err(|e| format!("decode icon {icon:?}: {e}"))?
-                .to_rgba8();
-            let (w, h) = img.dimensions();
-            let alpha: Vec<u8> = img.pixels().map(|p| p.0[3]).collect();
-            icon_sources.push(IconSource { icon, w, h, alpha });
-        }
-        icon_sources.push(spinner_source());
+        let icon_texture = upload::create_texture(
+            device,
+            mem_props,
+            ATLAS_SIZE,
+            ATLAS_SIZE,
+            vk::Format::R8G8B8A8_UNORM,
+        )?;
 
         let mut ts = TextSystem {
             font,
             texture,
+            icon_texture,
             packer: Packer::new(),
+            icon_packer: Packer::new(),
             glyphs: HashMap::new(),
-            icon_sources,
+            icon_sources: rasterize_icons(scale),
             icon_uvs: HashMap::new(),
             pending: Vec::new(),
             scale,
             resets: 0,
         };
-        // The very first upload must cover the whole texture so the image
-        // leaves UNDEFINED layout: zero it, then pack the icons.
+        // The first upload of each atlas must cover the whole texture so the
+        // image leaves UNDEFINED layout: zero both, then pack the icons.
         ts.pending.push(PendingUpload {
             texture_image: ts.texture.image,
             bytes: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE) as usize],
+            x: 0,
+            y: 0,
+            width: ATLAS_SIZE,
+            height: ATLAS_SIZE,
+            initialized: false,
+        });
+        ts.pending.push(PendingUpload {
+            texture_image: ts.icon_texture.image,
+            bytes: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
             x: 0,
             y: 0,
             width: ATLAS_SIZE,
@@ -169,34 +189,43 @@ impl TextSystem {
     }
 
     /// Re-rasterize everything at a new output scale (window moved to a
-    /// differently-scaled display).
+    /// differently-scaled display). Glyphs re-rasterize lazily; icons are
+    /// re-rendered from SVG now so they stay crisp.
     pub fn set_scale(&mut self, scale: f32) {
         if (scale - self.scale).abs() < 1e-3 {
             return;
         }
         self.scale = scale;
         self.reset();
+        self.reset_icons();
     }
 
     pub fn begin_frame(&mut self) {
         self.resets = 0;
     }
 
+    /// Reset the glyph atlas only (packer + cache); called when it fills.
     fn reset(&mut self) {
         self.packer = Packer::new();
         self.glyphs.clear();
+    }
+
+    /// Re-rasterize the icons at the current scale and re-pack the icon atlas.
+    fn reset_icons(&mut self) {
+        self.icon_packer = Packer::new();
         self.icon_uvs.clear();
+        self.icon_sources = rasterize_icons(self.scale);
         self.pack_icons();
     }
 
     fn pack_icons(&mut self) {
         for i in 0..self.icon_sources.len() {
             let (w, h) = (self.icon_sources[i].w, self.icon_sources[i].h);
-            if let Some((x, y)) = self.packer.pack(w, h) {
+            if let Some((x, y)) = self.icon_packer.pack(w, h) {
                 let src = &self.icon_sources[i];
                 self.pending.push(PendingUpload {
-                    texture_image: self.texture.image,
-                    bytes: src.alpha.clone(),
+                    texture_image: self.icon_texture.image,
+                    bytes: src.rgba.clone(),
                     x,
                     y,
                     width: w,
@@ -405,11 +434,47 @@ fn uv_rect(x: u32, y: u32, w: u32, h: u32) -> [f32; 4] {
     [x as f32 / s, y as f32 / s, (x + w) as f32 / s, (y + h) as f32 / s]
 }
 
+/// Rasterize every icon SVG at the given output scale, plus the procedural
+/// spinner. Monochrome icons are whitened (premultiplied white masked by the
+/// shape's alpha) so the draw-time tint recolours them.
+fn rasterize_icons(scale: f32) -> Vec<IconSource> {
+    let px = (ICON_RASTER * scale).round().max(1.0) as u32;
+    let opt = usvg::Options::default();
+    let mut out = Vec::with_capacity(ICON_SVGS.len() + 1);
+    for (bytes, icon, mono) in ICON_SVGS {
+        if let Some(rgba) = rasterize_svg(bytes, px, mono, &opt) {
+            out.push(IconSource { icon, w: px, h: px, rgba });
+        }
+    }
+    out.push(spinner_source());
+    out
+}
+
+/// Rasterize one SVG to a `px`×`px` premultiplied-RGBA buffer, scaled to fit.
+/// `mono` whitens the result (keeps only the shape's coverage).
+fn rasterize_svg(bytes: &[u8], px: u32, mono: bool, opt: &usvg::Options) -> Option<Vec<u8>> {
+    let tree = usvg::Tree::from_data(bytes, opt).ok()?;
+    let mut pixmap = tiny_skia::Pixmap::new(px, px)?;
+    let size = tree.size();
+    let sx = px as f32 / size.width();
+    let sy = px as f32 / size.height();
+    resvg::render(&tree, tiny_skia::Transform::from_scale(sx, sy), &mut pixmap.as_mut());
+    let mut rgba = pixmap.take(); // premultiplied RGBA
+    if mono {
+        for p in rgba.chunks_exact_mut(4) {
+            let a = p[3];
+            (p[0], p[1], p[2]) = (a, a, a);
+        }
+    }
+    Some(rgba)
+}
+
 /// The C app referenced a busy.svg that never existed; generate the spinner
-/// procedurally instead: a ring with an angular alpha fade and a gap.
+/// procedurally instead: a ring with an angular alpha fade and a gap. Whitened
+/// premultiplied RGBA so it tints like the other monochrome icons.
 fn spinner_source() -> IconSource {
     const S: u32 = 64;
-    let mut alpha = vec![0u8; (S * S) as usize];
+    let mut rgba = vec![0u8; (S * S * 4) as usize];
     let c = S as f32 / 2.0;
     let outer = 28.0;
     let inner = 20.0;
@@ -426,8 +491,10 @@ fn spinner_source() -> IconSource {
             // angle 0..1, fading tail with a gap at the head
             let angle = dy.atan2(dx) / (2.0 * std::f32::consts::PI) + 0.5;
             let fade = (angle * 1.15).min(1.0) * if angle > 0.95 { 0.0 } else { 1.0 };
-            alpha[(y * S + x) as usize] = (ring * fade * 255.0) as u8;
+            let a = (ring * fade * 255.0) as u8;
+            let idx = ((y * S + x) * 4) as usize;
+            rgba[idx..idx + 4].copy_from_slice(&[a, a, a, a]);
         }
     }
-    IconSource { icon: Icon::Busy, w: S, h: S, alpha }
+    IconSource { icon: Icon::Busy, w: S, h: S, rgba }
 }
