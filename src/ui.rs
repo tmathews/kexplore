@@ -29,7 +29,7 @@ pub enum Action {
     None,
     /// Click in the URL bar: begin/continue editing, position the caret.
     UrlBar,
-    FocusRoot,
+    FocusHome,
     FocusSelection,
     FocusParentItem,
     FocusNodeTop,
@@ -409,8 +409,9 @@ impl Ui {
 
 /// Colors from draw.c.
 const COLOR_BOX_FILL: Rgba = Rgba([0, 0, 0, 128]); // rgba(0,0,0,0.5)
-const COLOR_ROW_SELECTED: Rgba = Rgba([255, 0, 0, 255]);
-const COLOR_ROW_OPEN: Rgba = Rgba([0, 255, 0, 255]);
+/// The selected row is highlighted with the app's amber accent (the same
+/// colour as the active route), instead of colouring the label text.
+const COLOR_ROW_SELECTED_BG: Rgba = Rgba([255, 191, 64, 66]); // amber ~0.26
 const HOVER_ROW_BG: Rgba = Rgba([255, 255, 255, 26]); // white 0.10
 const HOVER_BUTTON_BG: Rgba = Rgba([255, 255, 255, 38]); // white 0.15
 /// Zebra striping on alternate rows — fainter than the hover highlight so it
@@ -761,10 +762,16 @@ fn draw_entries(
 
         if in_view {
             let row_action = Action::Row { node: id, item: i };
-            // Zebra striping on odd rows (#15), under the hover highlight.
+            // Row backgrounds, painted bottom-up: zebra, then the persistent
+            // selection highlight, then the hover feedback.
             if i % 2 == 1 {
                 if let Some(bg) = band.intersect(content_clip) {
                     list.rect(view.w2s_rect(bg), ALT_ROW_BG, 0.0);
+                }
+            }
+            if selected {
+                if let Some(bg) = band.intersect(content_clip) {
+                    list.rect(view.w2s_rect(bg), COLOR_ROW_SELECTED_BG, 3.0);
                 }
             }
             if ui.hover == Some(row_action) {
@@ -772,13 +779,9 @@ fn draw_entries(
                     list.rect(view.w2s_rect(bg), HOVER_ROW_BG, 3.0);
                 }
             }
-            let color = if selected {
-                COLOR_ROW_SELECTED
-            } else if child.is_some() {
-                COLOR_ROW_OPEN
-            } else {
-                Rgba::WHITE
-            };
+            // Labels are always white now; state is shown by the row highlight
+            // (selection) and the connector wire (open).
+            let color = Rgba::WHITE;
             // File-type icon (#14): folder for directories, page for files.
             // Only drawn when the row sits fully inside the box so it never
             // pokes past a scrolled edge (text uses draw_clipped for that).
@@ -873,7 +876,7 @@ fn draw_navigation(
     let size = 22.0;
     let padding = 20.0;
     let buttons = [
-        (Icon::Home, Action::FocusRoot),
+        (Icon::Home, Action::FocusHome),
         (Icon::Selection, Action::FocusSelection),
         (Icon::Parent, Action::FocusParentItem),
         (Icon::Top, Action::FocusNodeTop),

@@ -372,6 +372,11 @@ fn main() {
                 ui.url.anchor = None;
                 blink_epoch = Instant::now();
                 dirty = true;
+            } else if matches!(action, Action::FocusHome) {
+                // Home button: navigate to $HOME (reopens its chain if any of
+                // it was closed) and jump the camera there.
+                navigate_to(&mut arena, &mut ui, &mut ts, root, &home, window);
+                dirty = true;
             } else {
                 handle_action(
                     action,
@@ -381,7 +386,6 @@ fn main() {
                     &tasks,
                     &file_handlers,
                     &mut children,
-                    root,
                     window,
                 );
                 dirty = true;
@@ -731,7 +735,6 @@ fn handle_action(
     tasks: &Tasks,
     file_handlers: &[handlers::Handler],
     children: &mut Vec<std::process::Child>,
-    root: NodeId,
     window: Point,
 ) {
     match action {
@@ -779,12 +782,6 @@ fn handle_action(
                 if !ui.favorites.remove(&p) {
                     ui.favorites.insert(p);
                 }
-            }
-        }
-        Action::FocusRoot => {
-            if let Some(n) = arena.get(root) {
-                let r = n.rect;
-                ui.focus_to_rect(r, window);
             }
         }
         Action::FocusSelection => {
@@ -864,9 +861,13 @@ fn handle_action(
                 None => eprintln!("no handler for {}", path.display()),
             }
         }
-        // UrlBar is handled inline in the main loop (needs text/caret state);
-        // ResizePreview is press-driven in process_input, nothing on click.
-        Action::NodeBody | Action::None | Action::UrlBar | Action::ResizePreview { .. } => {}
+        // UrlBar and FocusHome are handled inline in the main loop (they need
+        // text/caret state or navigate_to); ResizePreview is press-driven.
+        Action::NodeBody
+        | Action::None
+        | Action::UrlBar
+        | Action::FocusHome
+        | Action::ResizePreview { .. } => {}
     }
 }
 
