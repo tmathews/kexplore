@@ -81,6 +81,9 @@ pub enum DragState {
     Pending { origin: Point, kind: DragKind },
     Node(NodeId),
     Resize(NodeId),
+    /// Rubber-band selection: a left-drag started on empty canvas. `origin` is
+    /// the fixed corner (screen px); the moving corner is the live cursor.
+    Marquee { origin: Point },
 }
 
 /// What an in-progress touchpad 2-finger scroll gesture is doing. Locked at
@@ -108,6 +111,9 @@ pub struct Ui {
     zoom_pivot_world: Point,
     zoom_pivot_screen: Point,
     pub selection: Option<(NodeId, usize)>,
+    /// Nodes in the current marquee multi-selection. Dragging any one of them
+    /// moves the whole set; a click on empty canvas clears it.
+    pub selected_nodes: HashSet<NodeId>,
     pub selected_path: Option<PathBuf>,
     /// Paths the user has starred (in-memory for now; #10 adds persistence).
     pub favorites: HashSet<PathBuf>,
@@ -175,6 +181,7 @@ impl Ui {
             zoom_pivot_world: Point::ZERO,
             zoom_pivot_screen: Point::ZERO,
             selection: None,
+            selected_nodes: HashSet::new(),
             selected_path: None,
             favorites: HashSet::new(),
             hitboxes: Vec::new(),
@@ -395,23 +402,45 @@ impl Ui {
             let delta = cursor.sub(self.last_pointer).scale(1.0 / self.zoom);
             if let DragState::Pending { origin, kind } = self.drag {
                 if cursor.sub(origin).length() >= 1.0 {
-                    // Left-drag on empty canvas is inert (reserved for later);
+                    // Left-drag on empty canvas rubber-bands a selection;
                     // panning is middle-button only.
                     self.drag = match kind {
-                        DragKind::Node(id) => DragState::Node(id),
+                        DragKind::Node(id) => {
+                            // Grabbing a node outside the current multi-selection
+                            // starts a fresh single-node move, so clear the set.
+                            if !self.selected_nodes.contains(&id) {
+                                self.selected_nodes.clear();
+                            }
+                            DragState::Node(id)
+                        }
                         DragKind::Resize(id) => DragState::Resize(id),
-                        DragKind::None => DragState::None,
+                        DragKind::None => DragState::Marquee { origin },
                     };
                 }
             }
             match self.drag {
                 DragState::Node(id) => {
-                    if let Some(node) = arena.get_mut(id) {
+                    // If the grabbed node is part of the multi-selection, move
+                    // the whole set together; otherwise just this one.
+                    if self.selected_nodes.len() > 1 && self.selected_nodes.contains(&id) {
+                        for &nid in &self.selected_nodes {
+                            if let Some(node) = arena.get_mut(nid) {
+                                node.anim_to = None;
+                                node.rect = node.rect.offset(delta);
+                            }
+                        }
+                        dirty = true;
+                    } else if let Some(node) = arena.get_mut(id) {
                         // Grabbing a node cancels any in-flight collision glide.
                         node.anim_to = None;
                         node.rect = node.rect.offset(delta);
                         dirty = true;
                     }
+                }
+                DragState::Marquee { .. } => {
+                    // The band is drawn from `origin` + the live cursor; just
+                    // keep redrawing as it grows.
+                    dirty = true;
                 }
                 DragState::Resize(id) => {
                     // Aspect-locked resize from the corner: width follows the
@@ -453,10 +482,20 @@ impl Ui {
                     }
                     action = Some((h.action, double));
                 } else {
+                    // A plain click on empty canvas drops the multi-selection.
                     self.last_click = None;
+                    if !self.selected_nodes.is_empty() {
+                        self.selected_nodes.clear();
+                        dirty = true;
+                    }
                 }
             }
+            // A group move leaves the nodes where dropped (snapping each against
+            // the others would just make them fight); only a lone node snaps.
+            let group_move = matches!(self.drag, DragState::Node(id)
+                if self.selected_nodes.len() > 1 && self.selected_nodes.contains(&id));
             if let DragState::Node(id) | DragState::Resize(id) = self.drag {
+              if !group_move {
                 // Snap-on-release: if the dropped/resized node overlaps others,
                 // glide it to the nearest free spot (search all four directions).
                 if let Some(cand) = arena.get(id).map(|n| n.rect) {
@@ -472,6 +511,24 @@ impl Ui {
                         }
                     }
                 }
+              }
+            }
+            if let DragState::Marquee { origin } = self.drag {
+                // Select every node whose box overlaps the band. Corners are in
+                // screen px; convert to world (world = screen/zoom + camera).
+                let to_world = |p: Point| p.scale(1.0 / self.zoom).add(self.camera);
+                let (a, b) = (to_world(origin), to_world(cursor));
+                let band = Rect {
+                    min: Point::new(a.x.min(b.x), a.y.min(b.y)),
+                    max: Point::new(a.x.max(b.x), a.y.max(b.y)),
+                };
+                self.selected_nodes.clear();
+                for (nid, node) in arena.iter() {
+                    if band.intersects(node.rect) {
+                        self.selected_nodes.insert(nid);
+                    }
+                }
+                dirty = true;
             }
             if !matches!(self.drag, DragState::None) {
                 self.drag = DragState::None;
@@ -503,6 +560,10 @@ const HEADER_PAD: f32 = 7.0;
 const HEADER_BTN_GAP: f32 = 4.0;
 /// Border for nodes on the chain from root to the current selection.
 const COLOR_PATH_BORDER: Rgba = Rgba([255, 191, 64, 255]);
+/// Multi-selection accent: a cyan distinct from the amber route colour, used
+/// for the dashed border on marquee-selected nodes and the rubber-band itself.
+const COLOR_MULTISELECT: Rgba = Rgba([90, 200, 255, 255]);
+const COLOR_MARQUEE_FILL: Rgba = Rgba([90, 200, 255, 36]);
 
 /// Two clicks on the same target within this window count as a double click.
 const DOUBLE_CLICK_MS: u128 = 400;
@@ -514,6 +575,33 @@ const PREVIEW_HANDLE: f32 = 16.0;
 
 fn inflate(r: Rect, by: f32) -> Rect {
     Rect { min: Point::new(r.min.x - by, r.min.y - by), max: Point::new(r.max.x + by, r.max.y + by) }
+}
+
+/// Stroke a dashed rectangle border (screen px), walking each edge in
+/// fixed-length dashes. Used for the marquee multi-selection indicator.
+fn draw_dashed_rect(list: &mut DrawList, r: Rect, color: Rgba, width: f32) {
+    const DASH: f32 = 6.0;
+    const GAP: f32 = 4.0;
+    let mut edge = |a: Point, b: Point| {
+        let span = b.sub(a);
+        let len = span.length();
+        if len < 0.5 {
+            return;
+        }
+        let dir = span.scale(1.0 / len);
+        let mut t = 0.0;
+        while t < len {
+            let e = (t + DASH).min(len);
+            list.line(a.add(dir.scale(t)), a.add(dir.scale(e)), width, color);
+            t += DASH + GAP;
+        }
+    };
+    let (tl, tr) = (Point::new(r.min.x, r.min.y), Point::new(r.max.x, r.min.y));
+    let (br, bl) = (Point::new(r.max.x, r.max.y), Point::new(r.min.x, r.max.y));
+    edge(tl, tr);
+    edge(tr, br);
+    edge(br, bl);
+    edge(bl, tl);
 }
 
 pub struct FrameOut {
@@ -551,6 +639,16 @@ pub fn build_frame(
     draw_grid(canvas, view);
     draw_connectors(arena, root, canvas, view, cap, &path);
     draw_entries(ui, arena, root, ts, canvas, view, spin_angle, &path, &mut out);
+    // The rubber-band draws on top of the nodes, in screen px (like the grid).
+    if let DragState::Marquee { origin } = ui.drag {
+        let cur = ui.last_pointer;
+        let band = Rect {
+            min: Point::new(origin.x.min(cur.x), origin.y.min(cur.y)),
+            max: Point::new(origin.x.max(cur.x), origin.y.max(cur.y)),
+        };
+        canvas.rect(band, COLOR_MARQUEE_FILL, 0.0);
+        canvas.rect_stroke(band, COLOR_MULTISELECT, 0.0, 1.0);
+    }
     draw_navigation(ui, ts, overlay, window, caret_visible, root_path.as_deref());
     out
 }
@@ -777,6 +875,9 @@ fn draw_entries(
             list.image_tex(view.w2s_rect(img_world), tex);
             let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
             list.rect_stroke(screen, border, 5.0, 3.0);
+            if ui.selected_nodes.contains(&id) {
+                draw_dashed_rect(list, inflate(screen, 4.0), COLOR_MULTISELECT, 2.0);
+            }
             ui.hitboxes.push(Hitbox { area: screen, action: Action::NodeBody, drag: DragKind::Node(id) });
             // Unpinned previews show a pin button (they are transient); pinned
             // ones show a close button.
@@ -807,6 +908,9 @@ fn draw_entries(
         list.rect(screen_rect, COLOR_BOX_FILL, 5.0);
         let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
         list.rect_stroke(screen_rect, border, 5.0, 3.0);
+        if ui.selected_nodes.contains(&id) {
+            draw_dashed_rect(list, inflate(screen_rect, 4.0), COLOR_MULTISELECT, 2.0);
+        }
         ui.hitboxes.push(Hitbox { area: screen_rect, action: Action::NodeBody, drag: DragKind::Node(id) });
         let primary = (!is_root).then_some((Icon::Close, Action::CloseNode { node: id }));
         draw_header(ui, ts, list, view, id, node_rect, Icon::Folder, primary, favorited);
