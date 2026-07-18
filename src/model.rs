@@ -227,6 +227,11 @@ pub fn preview_node(
 pub const ROW_ICON: f32 = 15.0;
 pub const ROW_ICON_GAP: f32 = 5.0;
 
+/// Height of the node header bar (title strip at the top of every box) and the
+/// minimum box width needed to fit its type icon plus the action buttons.
+pub const HEADER_H: f32 = 24.0;
+pub const HEADER_MIN_W: f32 = 82.0;
+
 /// Port of node_calc_size: stack rows vertically with 5px padding, size the
 /// box to the widest row, and position it to the right of the parent item.
 /// The displayed box is capped to `max_size` (90% of the safe viewing area);
@@ -238,7 +243,8 @@ pub fn calc_size(arena: &mut NodeArena, id: NodeId, ts: &mut TextSystem, max_siz
     // Room at the start of each row for the file-type icon (see ROW_ICON /
     // ROW_ICON_GAP in ui.rs; kept in sync here so the box is wide enough).
     let icon_advance = ROW_ICON + ROW_ICON_GAP;
-    let mut oy = PADDING;
+    // Rows begin below the header bar (a fixed strip at the top of the box).
+    let mut oy = HEADER_H;
     let mut max_w = 0.0f32;
     let mut rects = Vec::with_capacity(node.items.len());
     for item in &node.items {
@@ -267,7 +273,7 @@ pub fn calc_size(arena: &mut NodeArena, id: NodeId, ts: &mut TextSystem, max_siz
     for (item, r) in node.items.iter_mut().zip(rects) {
         item.rect = r;
     }
-    node.content_w = max_w + 2.0 * PADDING;
+    node.content_w = (max_w + 2.0 * PADDING).max(HEADER_MIN_W);
     node.content_h = oy + PADDING;
     node.scroll = 0.0;
     let box_w = node.content_w.min(max_size.x);

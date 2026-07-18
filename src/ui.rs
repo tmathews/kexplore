@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::geom::{Point, Rect};
 use crate::gfx::renderer2d::{DrawList, Rgba, TexSlot};
-use crate::model::{NodeArena, NodeId, ROW_ICON, ROW_ICON_GAP};
+use crate::model::{NodeArena, NodeId, HEADER_H, ROW_ICON, ROW_ICON_GAP};
 use crate::platform::wayland::PointerState;
 use crate::text::{Icon, TextSystem};
 use crate::textfield::TextField;
@@ -39,6 +39,8 @@ pub enum Action {
     OpenWith { node: NodeId, item: usize },
     NodeBody,
     CloseNode { node: NodeId },
+    /// Toggle the node's path in the favorites set (header star button).
+    ToggleFavorite { node: NodeId },
     /// Press target for a preview node's corner resize handle.
     ResizePreview { node: NodeId },
 }
@@ -93,6 +95,8 @@ pub struct Ui {
     zoom_pivot_screen: Point,
     pub selection: Option<(NodeId, usize)>,
     pub selected_path: Option<PathBuf>,
+    /// Paths the user has starred (in-memory for now; #10 adds persistence).
+    pub favorites: HashSet<PathBuf>,
     pub hitboxes: Vec<Hitbox>,
     pub drag: DragState,
     pub url: TextField,
@@ -154,6 +158,7 @@ impl Ui {
             zoom_pivot_screen: Point::ZERO,
             selection: None,
             selected_path: None,
+            favorites: HashSet::new(),
             hitboxes: Vec::new(),
             drag: DragState::None,
             url: TextField::new(),
@@ -186,8 +191,6 @@ impl Ui {
     pub fn ensure_visible(&mut self, rect: Rect, window: Point) {
         const MARGIN: f32 = 12.0;
         let z = self.zoom;
-        // Include the close button hanging above the box.
-        let rect = Rect { min: Point::new(rect.min.x, rect.min.y - 30.0), max: rect.max };
         // If a lerp is already in flight, judge against where it is headed.
         let base = if self.refocus { self.camera_target } else { self.camera };
         // Safe-area bounds in world units (screen offsets scaled by 1/zoom).
@@ -343,7 +346,8 @@ impl Ui {
                             let aspect = (pv.img_w.max(1) as f32) / (pv.img_h.max(1) as f32);
                             let world_x = cursor.x / self.zoom + self.camera.x;
                             let new_w = (world_x - node.rect.min.x).max(PREVIEW_MIN_W);
-                            let new_h = new_w / aspect;
+                            // Box = header bar + aspect-locked image below it.
+                            let new_h = HEADER_H + new_w / aspect;
                             node.anim_to = None;
                             node.rect.max =
                                 Point::new(node.rect.min.x + new_w, node.rect.min.y + new_h);
@@ -412,6 +416,15 @@ const HOVER_BUTTON_BG: Rgba = Rgba([255, 255, 255, 38]); // white 0.15
 /// Zebra striping on alternate rows — fainter than the hover highlight so it
 /// never competes with it.
 const ALT_ROW_BG: Rgba = Rgba([255, 255, 255, 10]); // white ~0.04
+/// Header bar: a faint tint over the box fill, a divider line under it, and
+/// the gold used for a starred (favorited) node.
+const HEADER_BG: Rgba = Rgba([255, 255, 255, 15]); // ~0.06 tint
+const HEADER_DIV: Rgba = Rgba([255, 255, 255, 40]); // ~0.16 divider
+const COLOR_FAVORITE: Rgba = Rgba([255, 205, 70, 255]);
+const HEADER_ICON: f32 = 15.0;
+const HEADER_BTN: f32 = 16.0;
+const HEADER_PAD: f32 = 7.0;
+const HEADER_BTN_GAP: f32 = 4.0;
 /// Border for nodes on the chain from root to the current selection.
 const COLOR_PATH_BORDER: Rgba = Rgba([255, 191, 64, 255]);
 
@@ -483,6 +496,55 @@ fn path_nodes(arena: &NodeArena, selection: Option<(NodeId, usize)>) -> HashSet<
         cur = arena.get(id).and_then(|n| n.parent.map(|(p, _)| p));
     }
     set
+}
+
+/// Draw a node's header bar (the title strip at the top of its box): a subtle
+/// tint and divider, the type icon on the left, and favorite/close buttons on
+/// the right. Button hitboxes are pushed after the node-body one so they win
+/// the reverse hit-test. All coordinates are world; mapped via `view`.
+#[allow(clippy::too_many_arguments)]
+fn draw_header(
+    ui: &mut Ui,
+    ts: &TextSystem,
+    list: &mut DrawList,
+    view: View,
+    id: NodeId,
+    node_rect: Rect,
+    type_icon: Icon,
+    is_root: bool,
+    favorited: bool,
+) {
+    let hdr = Rect { min: node_rect.min, max: Point::new(node_rect.max.x, node_rect.min.y + HEADER_H) };
+    list.rect(view.w2s_rect(hdr), HEADER_BG, 5.0);
+    let dy = node_rect.min.y + HEADER_H;
+    let a = view.w2s(Point::new(node_rect.min.x, dy));
+    let b = view.w2s(Point::new(node_rect.max.x, dy));
+    list.line(a, b, 1.0, HEADER_DIV);
+    // Type icon, left, vertically centered.
+    let iy = node_rect.min.y + (HEADER_H - HEADER_ICON) * 0.5;
+    let ir = view.w2s_rect(Rect::from_xywh(node_rect.min.x + HEADER_PAD, iy, HEADER_ICON, HEADER_ICON));
+    list.glyph_quad(ir, ts.icon_uv(type_icon), Rgba::new(1.0, 1.0, 1.0, 0.85), 0.0);
+    // Action buttons, right to left: close (non-root), then favorite.
+    let by = node_rect.min.y + (HEADER_H - HEADER_BTN) * 0.5;
+    let mut bx = node_rect.max.x - HEADER_PAD - HEADER_BTN;
+    if !is_root {
+        let cr = view.w2s_rect(Rect::from_xywh(bx, by, HEADER_BTN, HEADER_BTN));
+        let action = Action::CloseNode { node: id };
+        if ui.hover == Some(action) {
+            list.rect(inflate(cr, 2.0), HOVER_BUTTON_BG, 4.0);
+        }
+        list.glyph_quad(cr, ts.icon_uv(Icon::Close), Rgba::WHITE, 0.0);
+        ui.hitboxes.push(Hitbox { area: cr, action, drag: DragKind::Node(id) });
+        bx -= HEADER_BTN + HEADER_BTN_GAP;
+    }
+    let fr = view.w2s_rect(Rect::from_xywh(bx, by, HEADER_BTN, HEADER_BTN));
+    let faction = Action::ToggleFavorite { node: id };
+    if ui.hover == Some(faction) {
+        list.rect(inflate(fr, 2.0), HOVER_BUTTON_BG, 4.0);
+    }
+    let star = if favorited { COLOR_FAVORITE } else { Rgba::new(1.0, 1.0, 1.0, 0.4) };
+    list.glyph_quad(fr, ts.icon_uv(Icon::Star), star, 0.0);
+    ui.hitboxes.push(Hitbox { area: fr, action: faction, drag: DragKind::Node(id) });
 }
 
 /// Faint background grid, in world space so it pans and zooms with the
@@ -613,7 +675,7 @@ fn draw_entries(
 
     // Re-clamp the box and scroll every frame so window resizes keep the
     // 90% rule without a relayout. Preview boxes are user-sized and skip this.
-    let (node_rect, scroll, content_h, is_root, preview_tex) = {
+    let (node_rect, scroll, content_h, is_root, preview_tex, favorited) = {
         let Some(node) = arena.get_mut(id) else { return };
         let preview_tex = node.preview.map(|p| p.tex);
         if preview_tex.is_none() {
@@ -622,35 +684,26 @@ fn draw_entries(
             node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
             node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
         }
-        (node.rect, node.scroll, node.content_h, node.parent.is_none(), preview_tex)
+        let favorited = ui.favorites.contains(&node.path);
+        (node.rect, node.scroll, node.content_h, node.parent.is_none(), preview_tex, favorited)
     };
 
-    // World-space close button rect for a non-root node (hangs above top-left).
-    let close_world =
-        Rect::from_xywh(node_rect.min.x + 2.0, node_rect.min.y - 25.0, 20.0, 20.0);
-
-    // Preview node: draw the image, a close button, and a corner resize
+    // Preview node: header bar, the image below it, and a corner resize
     // handle, then stop — no rows, no scroll, no children.
     if let Some(tex) = preview_tex {
         if visible.intersects(node_rect) {
             let screen = view.w2s_rect(node_rect);
-            list.rect(screen, COLOR_BOX_FILL, 3.0); // shows through transparency
-            let img = Rect {
-                min: Point::new(screen.min.x + 2.0, screen.min.y + 2.0),
-                max: Point::new(screen.max.x - 2.0, screen.max.y - 2.0),
+            list.rect(screen, COLOR_BOX_FILL, 5.0);
+            // Image fills the content region below the header.
+            let img_world = Rect {
+                min: Point::new(node_rect.min.x + 2.0, node_rect.min.y + HEADER_H),
+                max: Point::new(node_rect.max.x - 2.0, node_rect.max.y - 2.0),
             };
-            list.image_tex(img, tex);
+            list.image_tex(view.w2s_rect(img_world), tex);
             let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
-            list.rect_stroke(screen, border, 3.0, 2.0);
+            list.rect_stroke(screen, border, 5.0, 3.0);
             ui.hitboxes.push(Hitbox { area: screen, action: Action::NodeBody, drag: DragKind::Node(id) });
-            // Close button.
-            let cr = view.w2s_rect(close_world);
-            let caction = Action::CloseNode { node: id };
-            if ui.hover == Some(caction) {
-                list.rect(inflate(cr, 3.0), HOVER_BUTTON_BG, 5.0);
-            }
-            list.glyph_quad(cr, ts.icon_uv(Icon::Close), Rgba::WHITE, 0.0);
-            ui.hitboxes.push(Hitbox { area: cr, action: caction, drag: DragKind::Node(id) });
+            draw_header(ui, ts, list, view, id, node_rect, Icon::File, is_root, favorited);
             // Corner resize handle (bottom-right): two short edge lines.
             let hr = view.w2s_rect(Rect::from_xywh(
                 node_rect.max.x - PREVIEW_HANDLE,
@@ -673,21 +726,13 @@ fn draw_entries(
         let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
         list.rect_stroke(screen_rect, border, 5.0, 3.0);
         ui.hitboxes.push(Hitbox { area: screen_rect, action: Action::NodeBody, drag: DragKind::Node(id) });
-        if !is_root {
-            let r = view.w2s_rect(close_world);
-            let action = Action::CloseNode { node: id };
-            if ui.hover == Some(action) {
-                list.rect(inflate(r, 3.0), HOVER_BUTTON_BG, 5.0);
-            }
-            list.glyph_quad(r, ts.icon_uv(Icon::Close), Rgba::WHITE, 0.0);
-            ui.hitboxes.push(Hitbox { area: r, action, drag: DragKind::Node(id) });
-        }
+        draw_header(ui, ts, list, view, id, node_rect, Icon::Folder, is_root, favorited);
     }
 
-    // Rows draw shifted by the scroll offset and clip to the box interior.
+    // Rows draw shifted by the scroll offset and clip to below the header.
     // Everything below is computed in world coords and mapped via `view`.
     let content_clip = Rect {
-        min: Point::new(node_rect.min.x, node_rect.min.y + 2.0),
+        min: Point::new(node_rect.min.x, node_rect.min.y + HEADER_H),
         max: Point::new(node_rect.max.x, node_rect.max.y - 2.0),
     };
     let clip_screen = view.w2s_rect(content_clip);
@@ -782,14 +827,16 @@ fn draw_entries(
         }
     }
 
-    // Scrollbar indicator on the right edge while content overflows.
+    // Scrollbar indicator on the right edge (in the rows area, below the
+    // header) while content overflows.
     if scrolled && visible.intersects(node_rect) {
-        let box_h = node_rect.height();
-        let track_h = box_h - 8.0;
-        let thumb_h = (track_h * box_h / content_h).max(20.0);
-        let max_scroll = content_h - box_h;
+        let rows_view = (node_rect.height() - HEADER_H).max(1.0);
+        let rows_total = (content_h - HEADER_H).max(1.0);
+        let track_h = rows_view - 8.0;
+        let thumb_h = (track_h * rows_view / rows_total).max(20.0);
+        let max_scroll = content_h - node_rect.height();
         let t = if max_scroll > 0.0 { scroll / max_scroll } else { 0.0 };
-        let thumb_y = node_rect.min.y + 4.0 + t * (track_h - thumb_h);
+        let thumb_y = node_rect.min.y + HEADER_H + 4.0 + t * (track_h - thumb_h);
         let thumb = Rect::from_xywh(node_rect.max.x - 6.0, thumb_y, 3.0, thumb_h);
         list.rect(view.w2s_rect(thumb), Rgba::new(1.0, 1.0, 1.0, 0.35), 1.5);
     }

@@ -696,6 +696,14 @@ fn handle_action(
                 }
             }
         }
+        Action::ToggleFavorite { node } => {
+            if let Some(n) = arena.get(node) {
+                let p = n.path.clone();
+                if !ui.favorites.remove(&p) {
+                    ui.favorites.insert(p);
+                }
+            }
+        }
         Action::FocusRoot => {
             if let Some(n) = arena.get(root) {
                 let r = n.rect;
@@ -806,13 +814,14 @@ fn spawn_preview_node(
     let origin = Point::new(p.rect.max.x + 20.0, p.rect.min.y + item_y - p.scroll);
     let cap = ui::node_max_size(window);
     let aspect = (img_w.max(1) as f32) / (img_h.max(1) as f32);
+    // Box = header bar + aspect-locked image; cap the whole box to the area.
     let mut w = 320.0_f32.min(cap.x);
-    let mut h = w / aspect;
-    if h > cap.y {
-        h = cap.y;
-        w = h * aspect;
+    let mut box_h = model::HEADER_H + w / aspect;
+    if box_h > cap.y {
+        box_h = cap.y;
+        w = ((box_h - model::HEADER_H).max(1.0) * aspect).min(cap.x);
     }
-    let rect = geom::Rect::from_xywh(origin.x, origin.y, w, h);
+    let rect = geom::Rect::from_xywh(origin.x, origin.y, w, box_h);
     let child_id = arena.insert(model::preview_node(path, (node, item), tex, img_w, img_h, rect));
     if let Some(n) = arena.get_mut(node) {
         n.items[item].child = Some(child_id);
