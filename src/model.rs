@@ -34,22 +34,45 @@ pub struct Node {
     /// When set, the box glides its min corner toward this point (collision
     /// resolve after an open or a drag-release); cleared on arrival.
     pub anim_to: Option<Point>,
+    /// Pinned nodes stay open; unpinned ("transient") nodes are peeks that close
+    /// once the active route moves off them (files *and* directories). The root
+    /// is always pinned. Pinning a node pins its whole ancestor chain.
+    pub pinned: bool,
+    /// True once the user has manually resized the box, which turns off the
+    /// automatic content-fit clamp for directory nodes.
+    pub user_sized: bool,
     /// Some for file nodes: they represent a single file (metadata panel, plus
     /// an image when the type can be displayed) instead of directory rows.
     /// Directory nodes leave this None.
     pub file: Option<FileView>,
 }
 
-/// A file node's contents: its stat metadata, an optional decoded image, and
-/// whether it has been pinned open (unpinned file nodes are transient).
-#[derive(Clone, Copy)]
+/// A file node's contents: stat metadata, an optional decoded image, and the
+/// info-panel strings resolved once at creation (owner/group names, dates).
+#[derive(Clone)]
 pub struct FileView {
     pub meta: FileMeta,
     /// Present once an image preview has been decoded for a displayable type.
     pub image: Option<ImageTex>,
-    /// Unpinned file nodes are transient (opened on click, closed when the
-    /// active file moves); pinning keeps the node open like a directory node.
-    pub pinned: bool,
+    pub owner: String,
+    pub group: String,
+    pub modified: String,
+    pub created: String,
+}
+
+impl FileView {
+    /// Build the presentation for `meta`, resolving owner/group names and
+    /// formatting the modified/created timestamps.
+    pub fn new(meta: FileMeta, image: Option<ImageTex>) -> FileView {
+        FileView {
+            image,
+            owner: user_name(meta.uid),
+            group: group_name(meta.gid),
+            modified: fmt_time(meta.mtime),
+            created: fmt_time(meta.ctime),
+            meta,
+        }
+    }
 }
 
 /// A decoded image bound to a file node.
@@ -62,11 +85,7 @@ pub struct ImageTex {
     pub img_h: u32,
 }
 
-/// File stat metadata shown in a file node's info panel. All fields are Copy so
-/// `FileView` stays Copy; uid/gid resolve to names lazily at draw time.
-// uid/gid/mtime/ctime are captured now but only rendered in Phase 2 (owner,
-// group, and the modified/created dates).
-#[allow(dead_code)]
+/// File stat metadata shown in a file node's info panel.
 #[derive(Clone, Copy)]
 pub struct FileMeta {
     pub size: u64,
@@ -91,6 +110,54 @@ impl FileMeta {
             mtime: m.mtime(),
             ctime: m.ctime(),
         })
+    }
+}
+
+/// Resolve a uid to its login name (falling back to the numeric id).
+fn user_name(uid: u32) -> String {
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut buf = [0 as libc::c_char; 1024];
+        let mut out: *mut libc::passwd = std::ptr::null_mut();
+        let rc = libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut out);
+        if rc == 0 && !out.is_null() && !pwd.pw_name.is_null() {
+            std::ffi::CStr::from_ptr(pwd.pw_name).to_string_lossy().into_owned()
+        } else {
+            uid.to_string()
+        }
+    }
+}
+
+/// Resolve a gid to its group name (falling back to the numeric id).
+fn group_name(gid: u32) -> String {
+    unsafe {
+        let mut grp: libc::group = std::mem::zeroed();
+        let mut buf = [0 as libc::c_char; 1024];
+        let mut out: *mut libc::group = std::ptr::null_mut();
+        let rc = libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr(), buf.len(), &mut out);
+        if rc == 0 && !out.is_null() && !grp.gr_name.is_null() {
+            std::ffi::CStr::from_ptr(grp.gr_name).to_string_lossy().into_owned()
+        } else {
+            gid.to_string()
+        }
+    }
+}
+
+/// Format a Unix timestamp as local `YYYY-MM-DD HH:MM` (empty on failure).
+fn fmt_time(epoch: i64) -> String {
+    unsafe {
+        let t = epoch as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return String::new();
+        }
+        let mut buf = [0 as libc::c_char; 64];
+        let fmt = c"%Y-%m-%d %H:%M";
+        let n = libc::strftime(buf.as_mut_ptr(), buf.len(), fmt.as_ptr(), &tm);
+        if n == 0 {
+            return String::new();
+        }
+        std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
     }
 }
 
@@ -238,6 +305,8 @@ pub fn node_from_items(path: PathBuf, data: Vec<ItemData>) -> Node {
         content_h: 0.0,
         scroll: 0.0,
         anim_to: None,
+        pinned: false,
+        user_sized: false,
         file: None,
     }
 }
@@ -261,7 +330,9 @@ pub fn file_node(
         content_h: rect.height(),
         scroll: 0.0,
         anim_to: None,
-        file: Some(FileView { meta, image, pinned }),
+        pinned,
+        user_sized: false,
+        file: Some(FileView::new(meta, image)),
     }
 }
 

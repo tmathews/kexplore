@@ -149,6 +149,10 @@ fn main() {
         std::process::exit(1);
     });
     let root = arena.insert(model::node_from_items(PathBuf::from("/"), root_items));
+    // The root is permanent — always pinned, never pruned.
+    if let Some(n) = arena.get_mut(root) {
+        n.pinned = true;
+    }
     let (lw, lh) = platform.logical_size;
     let window0 = Point::new((lw.max(1)) as f32, (lh.max(1)) as f32);
     model::calc_size(&mut arena, root, &mut ts, ui::node_max_size(window0));
@@ -240,7 +244,7 @@ fn main() {
                         .and_then(|n| n.items.get(item))
                         .and_then(|it| it.child);
                     let attach = child.and_then(|c| arena.get(c)).is_some_and(|c| {
-                        c.path == path && c.file.is_some_and(|f| f.image.is_none())
+                        c.path == path && c.file.as_ref().is_some_and(|f| f.image.is_none())
                     });
                     if let (true, Some(child_id), Some(img)) = (attach, child, image) {
                         match make_preview_texture(&gfx, &renderer, &img) {
@@ -258,8 +262,8 @@ fn main() {
                                 let (lw, lh) = platform.logical_size;
                                 let win = Point::new(lw as f32, lh as f32);
                                 attach_image(
-                                    &mut arena, &mut ui, child_id, tex_id, img.width, img.height,
-                                    win,
+                                    &mut arena, &mut ui, &ts, child_id, tex_id, img.width,
+                                    img.height, win,
                                 );
                             }
                             Err(e) => eprintln!("preview texture failed: {e}"),
@@ -343,16 +347,13 @@ fn main() {
                 }
             }
         } else {
-            // Canvas keys: Space pins the active file node (keeps it open).
+            // Canvas keys: Space pins the active node (file or directory) so it
+            // stays open, along with its ancestor chain.
             for ev in &key_events {
                 if ev.keysym.raw() == ks::KEY_space {
                     if let Some(active) = ui.active_node {
-                        if let Some(n) = arena.get_mut(active) {
-                            if let Some(f) = &mut n.file {
-                                f.pinned = true;
-                                dirty = true;
-                            }
-                        }
+                        pin_node(&mut arena, active);
+                        dirty = true;
                     }
                 }
             }
@@ -415,6 +416,7 @@ fn main() {
                     double,
                     &mut arena,
                     &mut ui,
+                    &ts,
                     &tasks,
                     &file_handlers,
                     &mut children,
@@ -503,7 +505,7 @@ fn main() {
                 // Free textures of any file node that was closed.
                 let live: HashSet<u32> = arena
                     .iter()
-                    .filter_map(|(_, n)| n.file.and_then(|f| f.image).map(|img| img.tex))
+                    .filter_map(|(_, n)| n.file.as_ref().and_then(|f| f.image).map(|img| img.tex))
                     .collect();
                 ptex.retire_unused(&live, frame_counter);
                 ptex.destroy_old(&gfx.device, &renderer, frame_counter);
@@ -631,7 +633,7 @@ fn navigate_to(
             let r = n.rect;
             ui.focus_to_rect(r, window);
         }
-        ui.set_active(arena, Some(root));
+        activate(arena, ui, root);
         return true;
     }
 
@@ -661,7 +663,7 @@ fn navigate_to(
                     let r = n.rect;
                     ui.focus_to_rect(r, window);
                 }
-                ui.set_active(arena, Some(child));
+                activate(arena, ui, child);
             } else {
                 current = child;
             }
@@ -669,14 +671,14 @@ fn navigate_to(
             // Target file (must be the last component): open/focus its file node.
             let fnode = match arena.get(current).and_then(|n| n.items[idx].child) {
                 Some(c) => Some(c),
-                None => open_file_node(arena, ui, current, idx, cur_path.clone(), false, window),
+                None => open_file_node(arena, ui, ts, current, idx, cur_path.clone(), window),
             };
             if let Some(fid) = fnode {
                 if let Some(n) = arena.get(fid) {
                     let r = n.rect;
                     ui.focus_to_rect(r, window);
                 }
-                ui.set_active(arena, Some(fid));
+                activate(arena, ui, fid);
             }
             break;
         }
@@ -733,14 +735,15 @@ fn make_preview_texture(
     }
 }
 
-/// Returns true when the currently shown preview should be cleared (any row
-/// click, like the C preview_destroy call).
+/// Handle a resolved click action (row/node/header buttons). `ts` is needed to
+/// size freshly opened file nodes.
 #[allow(clippy::too_many_arguments)]
 fn handle_action(
     action: Action,
     double: bool,
     arena: &mut NodeArena,
     ui: &mut Ui,
+    ts: &TextSystem,
     tasks: &Tasks,
     file_handlers: &[handlers::Handler],
     children: &mut Vec<std::process::Child>,
@@ -773,16 +776,10 @@ fn handle_action(
             }
 
             // Single click opens (or focuses) the row's node and makes it
-            // active. Opening or focusing anything other than the current
-            // transient peek dismisses that peek.
-            let child_is_peek = child
-                .and_then(|c| arena.get(c))
-                .is_some_and(|c| c.file.is_some_and(|f| !f.pinned));
-            if !child_is_peek {
-                close_unpinned_files(arena);
-            }
+            // active; activating prunes every transient peek not on the route,
+            // so the previous unpinned file/dir peek is dismissed.
             if let Some(c) = child {
-                ui.set_active(arena, Some(c));
+                activate(arena, ui, c);
                 if let Some(r) = arena.get(c).map(|n| n.rect) {
                     ui.ensure_visible(r, window);
                 }
@@ -800,9 +797,9 @@ fn handle_action(
                 // File: open a fresh (unpinned) file node, activate it, and
                 // decode an image if the type supports it.
                 if let Some(child_id) =
-                    open_file_node(arena, ui, node, item, path.clone(), false, window)
+                    open_file_node(arena, ui, ts, node, item, path.clone(), window)
                 {
-                    ui.set_active(arena, Some(child_id));
+                    activate(arena, ui, child_id);
                     if preview::previewable(&path) {
                         if let Some(n) = arena.get_mut(node) {
                             n.items[item].preview_loading = true;
@@ -813,8 +810,9 @@ fn handle_action(
             }
         }
         Action::NodeBody { node } => {
-            // Clicking a node makes it active (URL bar + route follow it).
-            ui.set_active(arena, Some(node));
+            // Clicking a node makes it active (URL bar + route follow it) and
+            // dismisses any transient peek off its route.
+            activate(arena, ui, node);
         }
         Action::CloseNode { node } => {
             let parent = arena.get(node).and_then(|n| n.parent.map(|(p, _)| p));
@@ -833,12 +831,9 @@ fn handle_action(
                 }
             }
         }
-        Action::PinPreview { node } => {
-            if let Some(n) = arena.get_mut(node) {
-                if let Some(f) = &mut n.file {
-                    f.pinned = true;
-                }
-            }
+        Action::PinNode { node } => {
+            // Pin the node and its ancestor chain so it stays open.
+            pin_node(arena, node);
         }
         Action::FocusSelection => {
             if let Some(active) = ui.active_node {
@@ -863,44 +858,67 @@ fn handle_action(
         }
         // UrlBar, FocusHome, GoUp and CopyPath are handled inline in the main
         // loop (they need text/caret state, navigate_to, or the platform
-        // clipboard); ResizePreview is press-driven.
+        // clipboard); ResizeNode is press-driven.
         Action::None
         | Action::UrlBar
         | Action::FocusHome
         | Action::GoUp
         | Action::CopyPath
-        | Action::ResizePreview { .. } => {}
+        | Action::ResizeNode { .. } => {}
     }
 }
 
-/// Close every unpinned (transient) file node. There is at most one at a time;
-/// it is dismissed whenever the active file moves.
-fn close_unpinned_files(arena: &mut NodeArena) {
-    let ids: Vec<NodeId> = arena
-        .iter()
-        .filter(|(_, n)| n.file.is_some_and(|f| !f.pinned))
-        .map(|(id, _)| id)
-        .collect();
-    for id in ids {
+/// Pin `id` and its whole ancestor chain, so pinned nodes stay connected to the
+/// root and pruning never orphans a pin.
+fn pin_node(arena: &mut NodeArena, id: NodeId) {
+    let mut cur = Some(id);
+    while let Some(n) = cur {
+        cur = match arena.get_mut(n) {
+            Some(node) => {
+                node.pinned = true;
+                node.parent.map(|(p, _)| p)
+            }
+            None => None,
+        };
+    }
+}
+
+/// Close every unpinned node that is not on the active route (root -> active).
+/// With the pin-ancestors invariant, this never orphans a pinned node.
+fn prune_transients(arena: &mut NodeArena, active: Option<NodeId>) {
+    let mut keep: HashSet<NodeId> = HashSet::new();
+    let mut cur = active;
+    while let Some(id) = cur {
+        keep.insert(id);
+        cur = arena.get(id).and_then(|n| n.parent.map(|(p, _)| p));
+    }
+    let close: Vec<NodeId> =
+        arena.iter().filter(|(id, n)| !n.pinned && !keep.contains(id)).map(|(id, _)| id).collect();
+    for id in close {
         arena.close_recursive(id);
     }
 }
 
-/// Default file-node box (info panel; no image yet): fixed size, resized to the
-/// image aspect later if a preview decodes.
-const FILE_NODE_W: f32 = 260.0;
-const FILE_NODE_H: f32 = model::HEADER_H + 82.0;
+/// Make `node` active and dismiss every transient peek not on its route.
+fn activate(arena: &mut NodeArena, ui: &mut Ui, node: NodeId) {
+    ui.set_active(arena, Some(node));
+    prune_transients(arena, Some(node));
+}
 
-/// Synchronously create a file node for `path` (metadata only, no image yet),
-/// attach it as the open child of item `idx` in `node`, place it beside the row
-/// and collision-resolve it. Returns the new node id, or None if the stat fails.
+/// Default file-node width; the height is the header plus the info panel (an
+/// image, once decoded, grows the box between them).
+const FILE_NODE_W: f32 = 300.0;
+
+/// Synchronously create a transient file node for `path` (metadata only, no
+/// image yet), attach it as the open child of item `idx` in `node`, place it
+/// beside the row and collision-resolve it. None if the stat fails.
 fn open_file_node(
     arena: &mut NodeArena,
     ui: &mut Ui,
+    ts: &TextSystem,
     node: NodeId,
     idx: usize,
     path: PathBuf,
-    pinned: bool,
     window: Point,
 ) -> Option<NodeId> {
     let meta = model::FileMeta::read(&path)?;
@@ -909,8 +927,9 @@ fn open_file_node(
         let item_y = p.items.get(idx).map(|it| it.rect.min.y).unwrap_or(0.0);
         Point::new(p.rect.max.x + 20.0, p.rect.min.y + item_y - p.scroll)
     };
-    let rect = geom::Rect::from_xywh(origin.x, origin.y, FILE_NODE_W, FILE_NODE_H);
-    let child_id = arena.insert(model::file_node(path, (node, idx), meta, None, rect, pinned));
+    let h = model::HEADER_H + ui::file_info_height(ts);
+    let rect = geom::Rect::from_xywh(origin.x, origin.y, FILE_NODE_W, h);
+    let child_id = arena.insert(model::file_node(path, (node, idx), meta, None, rect, false));
     if let Some(n) = arena.get_mut(node) {
         n.items[idx].child = Some(child_id);
     }
@@ -926,11 +945,12 @@ fn open_file_node(
     Some(child_id)
 }
 
-/// Attach a decoded image to an existing file node, growing the box to the
-/// image aspect (capped to the safe area) and re-resolving collisions.
+/// Attach a decoded image to an existing file node, growing the box so the
+/// image (aspect-preserved) sits above the info panel, then re-resolve collisions.
 fn attach_image(
     arena: &mut NodeArena,
     ui: &mut Ui,
+    ts: &TextSystem,
     id: NodeId,
     tex: u32,
     img_w: u32,
@@ -938,13 +958,15 @@ fn attach_image(
     window: Point,
 ) {
     let cap = ui::node_max_size(window);
+    let info_h = ui::file_info_height(ts);
     let aspect = (img_w.max(1) as f32) / (img_h.max(1) as f32);
-    // Box = header bar + aspect-locked image; cap the whole box to the area.
+    // Box = header + aspect-preserved image + info panel; cap to the safe area.
     let mut w = 320.0_f32.min(cap.x);
-    let mut box_h = model::HEADER_H + w / aspect;
+    let mut box_h = model::HEADER_H + w / aspect + info_h;
     if box_h > cap.y {
         box_h = cap.y;
-        w = ((box_h - model::HEADER_H).max(1.0) * aspect).min(cap.x);
+        let img_h = (box_h - model::HEADER_H - info_h).max(1.0);
+        w = (img_h * aspect).min(cap.x);
     }
     let Some(n) = arena.get_mut(id) else { return };
     n.rect.max = Point::new(n.rect.min.x + w, n.rect.min.y + box_h);
@@ -1014,8 +1036,8 @@ fn apply_task_result(
                         ui.ensure_visible(target, window);
                     }
                     // Single-click-to-open triggered this scan; the freshly
-                    // opened directory becomes the active node.
-                    ui.set_active(arena, Some(child_id));
+                    // opened directory becomes active (pruning stale peeks).
+                    activate(arena, ui, child_id);
                 }
                 Err(e) => {
                     // C returned NULL silently; at least log it.

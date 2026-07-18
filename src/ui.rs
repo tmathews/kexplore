@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::geom::{Point, Rect};
 use crate::gfx::renderer2d::{DrawList, Rgba, TexSlot};
-use crate::model::{FileMeta, NodeArena, NodeId, HEADER_H, ROW_ICON, ROW_ICON_GAP};
+use crate::model::{FileView, NodeArena, NodeId, HEADER_H, ROW_ICON, ROW_ICON_GAP};
 use crate::platform::wayland::PointerState;
 use crate::text::{Icon, TextSystem};
 use crate::textfield::TextField;
@@ -41,10 +41,10 @@ pub enum Action {
     CloseNode { node: NodeId },
     /// Toggle the node's path in the favorites set (header star button).
     ToggleFavorite { node: NodeId },
-    /// Pin a transient file node so it stays open (header pin button).
-    PinPreview { node: NodeId },
-    /// Press target for a file node's corner resize handle.
-    ResizePreview { node: NodeId },
+    /// Pin a transient node (file or directory) so it stays open.
+    PinNode { node: NodeId },
+    /// Press target for a node's corner resize handle.
+    ResizeNode { node: NodeId },
 }
 
 /// What a press-drag on a hitbox does once it crosses the move threshold.
@@ -455,22 +455,18 @@ impl Ui {
                     dirty = true;
                 }
                 DragState::Resize(id) => {
-                    // Aspect-locked resize from the corner: width follows the
-                    // world-space cursor, height keeps the image's aspect.
+                    // Free resize from the corner: both dimensions follow the
+                    // world-space cursor. Any node is resizable; images inside a
+                    // file node letterbox into the space, directories scroll.
                     if let Some(node) = arena.get_mut(id) {
-                        if let Some(img) = node.file.and_then(|f| f.image) {
-                            let aspect = (img.img_w.max(1) as f32) / (img.img_h.max(1) as f32);
-                            let world_x = cursor.x / self.zoom + self.camera.x;
-                            let new_w = (world_x - node.rect.min.x).max(PREVIEW_MIN_W);
-                            // Box = header bar + aspect-locked image below it.
-                            let new_h = HEADER_H + new_w / aspect;
-                            node.anim_to = None;
-                            node.rect.max =
-                                Point::new(node.rect.min.x + new_w, node.rect.min.y + new_h);
-                            node.content_w = new_w;
-                            node.content_h = new_h;
-                            dirty = true;
-                        }
+                        let world_x = cursor.x / self.zoom + self.camera.x;
+                        let world_y = cursor.y / self.zoom + self.camera.y;
+                        let new_w = (world_x - node.rect.min.x).max(PREVIEW_MIN_W);
+                        let new_h = (world_y - node.rect.min.y).max(HEADER_H + 30.0);
+                        node.anim_to = None;
+                        node.rect.max = Point::new(node.rect.min.x + new_w, node.rect.min.y + new_h);
+                        node.user_sized = true;
+                        dirty = true;
                     }
                 }
                 _ => {}
@@ -553,7 +549,9 @@ impl Ui {
 
 /// Colors from draw.c.
 const COLOR_BOX_FILL: Rgba = Rgba([0, 0, 0, 128]); // rgba(0,0,0,0.5)
-const HOVER_ROW_BG: Rgba = Rgba([255, 255, 255, 26]); // white 0.10
+/// Hover highlight: the amber accent (reused from the old persistent selection
+/// colour, which read nicely) rather than a plain white tint.
+const HOVER_ROW_BG: Rgba = Rgba([255, 191, 64, 66]); // amber ~0.26
 const HOVER_BUTTON_BG: Rgba = Rgba([255, 255, 255, 38]); // white 0.15
 /// Zebra striping on alternate rows — fainter than the hover highlight so it
 /// never competes with it.
@@ -833,32 +831,69 @@ fn draw_connectors(
     }
 }
 
-/// Draw a file node's metadata panel (name, size, permissions) inside `body`
-/// (world coords). Phase 2 will add owner/group and modified/created dates.
+/// Number of text lines in a file node's info panel, and its total world
+/// height. Kept in step with `draw_file_info` and the node-creation sizing.
+const FILE_INFO_LINES: f32 = 5.0;
+const FILE_INFO_PAD: f32 = 6.0;
+pub fn file_info_height(ts: &TextSystem) -> f32 {
+    FILE_INFO_LINES * ts.line_height() + 2.0 * FILE_INFO_PAD
+}
+
+/// Draw a file node's metadata panel inside `body` (world coords): name, then
+/// size + permissions, owner:group, and the modified / created dates.
 fn draw_file_info(
     ts: &mut TextSystem,
     list: &mut DrawList,
     view: View,
     body: Rect,
     name: &str,
-    meta: &FileMeta,
+    fv: &FileView,
 ) {
-    const PAD: f32 = 6.0;
     let z = view.zoom;
     let lh = ts.line_height();
     let clip = view.w2s_rect(body);
-    let x = body.min.x + PAD;
+    let x = body.min.x;
     let dim = Rgba::new(1.0, 1.0, 1.0, 0.7);
     let lines = [
         (name.to_string(), Rgba::WHITE),
-        (fmt_size(meta.size), dim),
-        (fmt_mode(meta.mode), dim),
+        (format!("{}   {}", fmt_size(fv.meta.size), fmt_mode(fv.meta.mode)), dim),
+        (format!("{}:{}", fv.owner, fv.group), dim),
+        (format!("modified {}", fv.modified), dim),
+        (format!("created {}", fv.created), dim),
     ];
-    let mut y = body.min.y + PAD;
+    let mut y = body.min.y + FILE_INFO_PAD;
     for (s, color) in &lines {
         ts.draw_clipped(list, view.w2s(Point::new(x, y)), s, *color, clip, z);
         y += lh;
     }
+}
+
+/// Fit a rect of the given aspect (w/h) centred inside `region`, letterboxed.
+fn fit_rect(region: Rect, aspect: f32) -> Rect {
+    let (rw, rh) = (region.width(), region.height());
+    if rw <= 0.0 || rh <= 0.0 {
+        return region;
+    }
+    let (w, h) = if rw / rh > aspect { (rh * aspect, rh) } else { (rw, rw / aspect) };
+    let cx = region.min.x + rw * 0.5;
+    let cy = region.min.y + rh * 0.5;
+    Rect { min: Point::new(cx - w * 0.5, cy - h * 0.5), max: Point::new(cx + w * 0.5, cy + h * 0.5) }
+}
+
+/// Draw a node's bottom-right corner resize handle (two short edge lines) and
+/// push its press hitbox. Applies to every node — directory or file.
+fn draw_resize_handle(ui: &mut Ui, list: &mut DrawList, view: View, node_rect: Rect, id: NodeId) {
+    let hr = view.w2s_rect(Rect::from_xywh(
+        node_rect.max.x - PREVIEW_HANDLE,
+        node_rect.max.y - PREVIEW_HANDLE,
+        PREVIEW_HANDLE,
+        PREVIEW_HANDLE,
+    ));
+    let raction = Action::ResizeNode { node: id };
+    let hc = if ui.hover == Some(raction) { Rgba::WHITE } else { Rgba::new(1.0, 1.0, 1.0, 0.6) };
+    list.line(Point::new(hr.min.x, hr.max.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
+    list.line(Point::new(hr.max.x, hr.min.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
+    ui.hitboxes.push(Hitbox { area: hr, action: raction, drag: DragKind::Resize(id) });
 }
 
 /// Human-readable byte size, e.g. `1.2 MiB` (exact `B` under 1 KiB).
@@ -907,36 +942,50 @@ fn draw_entries(
     let z = view.zoom;
 
     // Re-clamp the box and scroll every frame so window resizes keep the
-    // 90% rule without a relayout. File nodes are user-sized and skip this.
-    let (node_rect, scroll, content_h, is_root, file_view, favorited, fname) = {
+    // 90% rule without a relayout. File nodes and user-resized boxes skip the
+    // content-fit clamp (they keep whatever size the user gave them).
+    let (node_rect, scroll, content_h, is_root, file_view, favorited, pinned, fname) = {
         let Some(node) = arena.get_mut(id) else { return };
-        let file_view = node.file;
+        let file_view = node.file.clone();
         if file_view.is_none() {
-            let box_w = node.content_w.min(cap.x);
-            let box_h = node.content_h.min(cap.y);
-            node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
+            if !node.user_sized {
+                let box_w = node.content_w.min(cap.x);
+                let box_h = node.content_h.min(cap.y);
+                node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
+            }
+            let box_h = node.rect.height();
             node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
         }
         let favorited = ui.favorites.contains(&node.path);
+        let pinned = node.pinned;
         let fname =
             node.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        (node.rect, node.scroll, node.content_h, node.parent.is_none(), file_view, favorited, fname)
+        (node.rect, node.scroll, node.content_h, node.parent.is_none(), file_view, favorited, pinned, fname)
     };
 
-    // File node: header, then either the decoded image or a metadata panel,
-    // plus a corner resize handle for images. No rows, scroll, or children.
+    // File node: header, the decoded image (if any) letterboxed above a metadata
+    // panel that always sits at the bottom, plus a resize handle. No rows.
     if let Some(fv) = file_view {
         if visible.intersects(node_rect) {
             let screen = view.w2s_rect(node_rect);
             list.rect(screen, COLOR_BOX_FILL, 5.0);
-            let body = Rect {
-                min: Point::new(node_rect.min.x + 2.0, node_rect.min.y + HEADER_H),
+            let info_h = file_info_height(ts);
+            let info_top = (node_rect.max.y - info_h).max(node_rect.min.y + HEADER_H);
+            if let Some(img) = fv.image {
+                // Image fills the region between the header and the info panel,
+                // preserving aspect (letterboxed).
+                let region = Rect {
+                    min: Point::new(node_rect.min.x + 2.0, node_rect.min.y + HEADER_H),
+                    max: Point::new(node_rect.max.x - 2.0, info_top),
+                };
+                let aspect = (img.img_w.max(1) as f32) / (img.img_h.max(1) as f32);
+                list.image_tex(view.w2s_rect(fit_rect(region, aspect)), img.tex);
+            }
+            let info = Rect {
+                min: Point::new(node_rect.min.x + 6.0, info_top),
                 max: Point::new(node_rect.max.x - 2.0, node_rect.max.y - 2.0),
             };
-            match fv.image {
-                Some(img) => list.image_tex(view.w2s_rect(body), img.tex),
-                None => draw_file_info(ts, list, view, body, &fname, &fv.meta),
-            }
+            draw_file_info(ts, list, view, info, &fname, &fv);
             let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
             list.rect_stroke(screen, border, 5.0, 3.0);
             if ui.selected_nodes.contains(&id) {
@@ -947,29 +996,15 @@ fn draw_entries(
                 action: Action::NodeBody { node: id },
                 drag: DragKind::Node(id),
             });
-            // Unpinned file nodes show a pin button (transient); pinned ones a
-            // close button.
-            let primary = if fv.pinned {
+            // Unpinned nodes show a pin button (transient); pinned ones a close
+            // button.
+            let primary = if pinned {
                 (Icon::Close, Action::CloseNode { node: id })
             } else {
-                (Icon::Pin, Action::PinPreview { node: id })
+                (Icon::Pin, Action::PinNode { node: id })
             };
             draw_header(ui, ts, list, view, id, node_rect, Icon::File, Some(primary), favorited);
-            // Aspect-locked corner resize handle, images only.
-            if fv.image.is_some() {
-                let hr = view.w2s_rect(Rect::from_xywh(
-                    node_rect.max.x - PREVIEW_HANDLE,
-                    node_rect.max.y - PREVIEW_HANDLE,
-                    PREVIEW_HANDLE,
-                    PREVIEW_HANDLE,
-                ));
-                let raction = Action::ResizePreview { node: id };
-                let hc =
-                    if ui.hover == Some(raction) { Rgba::WHITE } else { Rgba::new(1.0, 1.0, 1.0, 0.6) };
-                list.line(Point::new(hr.min.x, hr.max.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
-                list.line(Point::new(hr.max.x, hr.min.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
-                ui.hitboxes.push(Hitbox { area: hr, action: raction, drag: DragKind::Resize(id) });
-            }
+            draw_resize_handle(ui, list, view, node_rect, id);
         }
         return;
     }
@@ -983,7 +1018,15 @@ fn draw_entries(
             draw_dashed_rect(list, inflate(screen_rect, 4.0), COLOR_MULTISELECT, 2.0);
         }
         ui.hitboxes.push(Hitbox { area: screen_rect, action: Action::NodeBody { node: id }, drag: DragKind::Node(id) });
-        let primary = (!is_root).then_some((Icon::Close, Action::CloseNode { node: id }));
+        // Non-root directory nodes are pinnable like files: pin to keep, close
+        // when pinned. The root is permanent and shows no button.
+        let primary = (!is_root).then(|| {
+            if pinned {
+                (Icon::Close, Action::CloseNode { node: id })
+            } else {
+                (Icon::Pin, Action::PinNode { node: id })
+            }
+        });
         draw_header(ui, ts, list, view, id, node_rect, Icon::Folder, primary, favorited);
     }
 
@@ -1083,6 +1126,12 @@ fn draw_entries(
         let thumb_y = node_rect.min.y + HEADER_H + 4.0 + t * (track_h - thumb_h);
         let thumb = Rect::from_xywh(node_rect.max.x - 6.0, thumb_y, 3.0, thumb_h);
         list.rect(view.w2s_rect(thumb), Rgba::new(1.0, 1.0, 1.0, 0.35), 1.5);
+    }
+
+    // Directory resize handle, drawn last so it wins the bottom-right corner
+    // over any row beneath it.
+    if visible.intersects(node_rect) {
+        draw_resize_handle(ui, list, view, node_rect, id);
     }
 }
 
