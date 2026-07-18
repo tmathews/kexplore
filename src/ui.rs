@@ -318,8 +318,9 @@ impl Ui {
             if node_scrolled {
                 dirty = true;
             } else if pointer.scroll_finger {
-                // 2-finger pan (world delta = scroll / zoom).
-                self.camera = self.camera.add(Point::new(dx, dy).scale(1.0 / self.zoom));
+                // 2-finger pan: drag the canvas with the fingers (grab-style,
+                // like the middle-drag pan), world delta = scroll / zoom.
+                self.camera = self.camera.sub(Point::new(dx, dy).scale(1.0 / self.zoom));
                 self.refocus = false;
                 dirty = true;
             } else {
