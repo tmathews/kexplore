@@ -133,8 +133,11 @@ impl View {
 const LERP_RATE: f32 = 10.5;
 
 /// Zoom limits and how much one wheel notch multiplies the zoom target.
+/// Zoom is overview-only (out to 1:1): capping at 1.0 keeps canvas text
+/// always downscaled from the atlas, so it never blurs. (Zooming in past 1:1
+/// would need the atlas re-rasterized at the effective scale.)
 const ZOOM_MIN: f32 = 0.15;
-const ZOOM_MAX: f32 = 4.0;
+const ZOOM_MAX: f32 = 1.0;
 const ZOOM_PER_NOTCH: f32 = 1.15;
 /// Zoom smoothing rate (frame-rate independent, a touch snappier than pan).
 const ZOOM_LERP_RATE: f32 = 16.0;
