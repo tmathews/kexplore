@@ -790,21 +790,28 @@ fn handle_action(
                 }
                 return;
             }
+            // Dismiss any transient peek off this node's route *before* placing
+            // the newcomer, so its collision resolve isn't routed around a node
+            // that is about to close (which pushed it needlessly far down).
+            prune_transients(arena, Some(node));
             if is_dir {
                 // Directory: scan asynchronously; ScanDone activates the child.
                 if !scanning {
                     if let Some(n) = arena.get_mut(node) {
                         n.items[item].scanning = true;
                     }
+                    // Keep the active node valid during the async scan.
+                    ui.set_active(arena, Some(node));
                     tasks.spawn_scan(node, item, path);
                 }
             } else {
-                // File: open a fresh (unpinned) file node, activate it, and
-                // decode an image if the type supports it.
+                // File: open a fresh (unpinned) file node, make it active, and
+                // decode an image if the type supports it. (Peeks were pruned
+                // above, so the placement above is already collision-correct.)
                 if let Some(child_id) =
                     open_file_node(arena, ui, ts, node, item, path.clone(), window)
                 {
-                    activate(arena, ui, child_id);
+                    ui.set_active(arena, Some(child_id));
                     if preview::previewable(&path) {
                         if let Some(n) = arena.get_mut(node) {
                             n.items[item].preview_loading = true;
