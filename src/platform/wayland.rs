@@ -3,14 +3,16 @@
 //! (fractional via wp-fractional-scale-v1 + viewporter, with integer
 //! fallbacks). Port of the C app's klib/ layer.
 
+use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
 use wayland_client::{
-    delegate_noop,
+    delegate_noop, event_created_child,
     globals::{registry_queue_init, GlobalListContents},
     protocol::{
-        wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_surface,
+        wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source,
+        wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_surface,
     },
     Connection, Dispatch, EventQueue, QueueHandle, WEnum,
 };
@@ -30,6 +32,15 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 
 pub const BTN_LEFT: u32 = 272;
 pub const BTN_MIDDLE: u32 = 274;
+
+/// MIME types we advertise when copying, and accept when pasting, in order of
+/// preference. All are plain UTF-8 text.
+const TEXT_MIMES: [&str; 4] =
+    ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING"];
+
+fn is_text_mime(m: &str) -> bool {
+    TEXT_MIMES.contains(&m) || m == "TEXT"
+}
 
 #[derive(Clone, Copy, Default)]
 pub struct PointerState {
@@ -96,6 +107,24 @@ pub struct Platform {
     keyboard: Option<Keyboard>,
     /// Resolved key presses/repeats, drained by the main loop.
     pub key_events: Vec<KeyEvent>,
+
+    // Native clipboard (wl_data_device_manager). The seat is kept alive for the
+    // data device's lifetime.
+    _seat: wl_seat::WlSeat,
+    data_device_mgr: Option<wl_data_device_manager::WlDataDeviceManager>,
+    data_device: Option<wl_data_device::WlDataDevice>,
+    /// Latest input-event serial, needed to take the selection.
+    last_serial: u32,
+    /// Text we currently own on the clipboard, written on demand when another
+    /// client pastes; kept alive alongside `data_source`.
+    clipboard: Option<String>,
+    data_source: Option<wl_data_source::WlDataSource>,
+    /// MIME types announced by the offer currently being described (before its
+    /// `selection` event promotes it to the active one).
+    pending_mimes: Vec<String>,
+    /// The current clipboard offer from the compositor and its MIME types.
+    selection_offer: Option<wl_data_offer::WlDataOffer>,
+    selection_mimes: Vec<String>,
     cursor_theme: Option<CursorTheme>,
     cursor_surface: Option<wl_surface::WlSurface>,
     outputs: Vec<(wl_output::WlOutput, i32)>,
@@ -132,8 +161,13 @@ pub fn init(title: &str, app_id: &str, logical: (u32, u32)) -> Result<Init, Stri
         .map_err(|e| format!("wl_compositor: {e}"))?;
     let wm_base: xdg_wm_base::XdgWmBase =
         globals.bind(&qh, 1..=6, ()).map_err(|e| format!("xdg_wm_base: {e}"))?;
-    let _seat: wl_seat::WlSeat =
+    let seat: wl_seat::WlSeat =
         globals.bind(&qh, 1..=7, ()).map_err(|e| format!("wl_seat: {e}"))?;
+    // Core clipboard protocol (the thing wl-copy/wl-paste wrap). Optional so a
+    // stripped compositor still runs; copy/paste just no-op without it.
+    let data_device_mgr: Option<wl_data_device_manager::WlDataDeviceManager> =
+        globals.bind(&qh, 1..=3, ()).ok();
+    let data_device = data_device_mgr.as_ref().map(|m| m.get_data_device(&seat, &qh, ()));
     let shm: Option<wl_shm::WlShm> = globals.bind(&qh, 1..=1, ()).ok();
     let deco_mgr: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1> =
         globals.bind(&qh, 1..=1, ()).ok();
@@ -186,6 +220,15 @@ pub fn init(title: &str, app_id: &str, logical: (u32, u32)) -> Result<Init, Stri
         pinch_last_scale: 1.0,
         keyboard: None,
         key_events: Vec::new(),
+        _seat: seat,
+        data_device_mgr,
+        data_device,
+        last_serial: 0,
+        clipboard: None,
+        data_source: None,
+        pending_mimes: Vec::new(),
+        selection_offer: None,
+        selection_mimes: Vec::new(),
         cursor_theme,
         cursor_surface,
         outputs,
@@ -268,6 +311,44 @@ impl Platform {
     /// When the next key repeat is due, if a repeating key is held.
     pub fn next_repeat_deadline(&self) -> Option<Instant> {
         self.keyboard.as_ref().and_then(|k| k.repeat.as_ref()).map(|r| r.next)
+    }
+
+    /// Take ownership of the clipboard selection, offering `text` as UTF-8 to
+    /// any client that pastes. No-op if the compositor lacks the data-device
+    /// protocol. Replaces our previous selection, if any.
+    pub fn set_clipboard(&mut self, qh: &QueueHandle<Self>, text: String) {
+        let (Some(mgr), Some(dd)) = (&self.data_device_mgr, &self.data_device) else {
+            return;
+        };
+        let source = mgr.create_data_source(qh, ());
+        for m in TEXT_MIMES {
+            source.offer(m.to_string());
+        }
+        dd.set_selection(Some(&source), self.last_serial);
+        self.clipboard = Some(text);
+        self.data_source = Some(source);
+    }
+
+    /// Read the clipboard selection as text. If we own it, return our copy
+    /// directly; otherwise pipe it from the owning client (a brief blocking
+    /// read — clipboard payloads here are tiny). None if nothing text-like is
+    /// offered or the protocol is unavailable.
+    pub fn clipboard_text(&mut self, conn: &Connection) -> Option<String> {
+        // We own the selection: hand back our copy (avoids a round-trip and a
+        // self-write deadlock, since our own Send would need this queue).
+        if self.data_source.is_some() {
+            return self.clipboard.clone();
+        }
+        let offer = self.selection_offer.clone()?;
+        let mime = self.selection_mimes.iter().find(|m| is_text_mime(m))?.clone();
+        let (mut reader, writer) = std::io::pipe().ok()?;
+        offer.receive(mime, writer.as_fd());
+        drop(writer); // close our write end so the read hits EOF
+        conn.flush().ok()?;
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf).ok()?;
+        buf.retain(|c| c != '\0');
+        Some(buf)
     }
 
     /// Emit synthetic key events for any repeats that have come due.
@@ -529,8 +610,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Platform {
                 }
             }
             wl_keyboard::Event::Key {
-                key, state: WEnum::Value(key_state), ..
+                serial, key, state: WEnum::Value(key_state), ..
             } => {
+                state.last_serial = serial;
                 let Some(s) = kb.state.as_ref() else { return };
                 match key_state {
                     wl_keyboard::KeyState::Pressed => {
@@ -581,7 +663,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Platform {
                 state.pointer_state.x = surface_x;
                 state.pointer_state.y = surface_y;
             }
-            wl_pointer::Event::Button { button, state: btn_state, .. } => {
+            wl_pointer::Event::Button { serial, button, state: btn_state, .. } => {
+                state.last_serial = serial;
                 if button == BTN_LEFT {
                     match btn_state {
                         WEnum::Value(wl_pointer::ButtonState::Pressed) => {
@@ -664,6 +747,99 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()> for Pl
     }
 }
 
+// Clipboard: the data device delivers incoming selection offers. A new offer
+// arrives as DataOffer (its MIME types then stream in via wl_data_offer), and
+// Selection promotes one (or None) to the active clipboard.
+impl Dispatch<wl_data_device::WlDataDevice, ()> for Platform {
+    fn event(
+        state: &mut Self,
+        _: &wl_data_device::WlDataDevice,
+        event: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_data_device::Event::DataOffer { .. } => {
+                // A fresh offer begins; collect its MIME types until Selection.
+                state.pending_mimes.clear();
+            }
+            wl_data_device::Event::Selection { id } => {
+                // Replace the active offer; destroy the previous to free it.
+                if let Some(old) = state.selection_offer.take() {
+                    old.destroy();
+                }
+                match id {
+                    Some(offer) => {
+                        state.selection_mimes = std::mem::take(&mut state.pending_mimes);
+                        state.selection_offer = Some(offer);
+                    }
+                    None => {
+                        state.selection_mimes.clear();
+                        state.pending_mimes.clear();
+                    }
+                }
+            }
+            _ => {} // DnD (Enter/Leave/Motion/Drop) — unused.
+        }
+    }
+    // The data_offer event creates a child wl_data_offer object; the sys
+    // backend needs this to know how to construct it (with `()` user data).
+    event_created_child!(Platform, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+    ]);
+}
+
+impl Dispatch<wl_data_offer::WlDataOffer, ()> for Platform {
+    fn event(
+        state: &mut Self,
+        _: &wl_data_offer::WlDataOffer,
+        event: wl_data_offer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_data_offer::Event::Offer { mime_type } = event {
+            state.pending_mimes.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<wl_data_source::WlDataSource, ()> for Platform {
+    fn event(
+        state: &mut Self,
+        source: &wl_data_source::WlDataSource,
+        event: wl_data_source::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            // Another client is pasting: write our text to the pipe fd. The
+            // payload is small (paths/URLs), so a blocking write is fine.
+            wl_data_source::Event::Send { mime_type, fd } => {
+                if is_text_mime(&mime_type) {
+                    if let Some(text) = &state.clipboard {
+                        let mut file = std::fs::File::from(fd);
+                        let _ = file.write_all(text.as_bytes());
+                    }
+                }
+            }
+            // We lost ownership (someone else took the selection). Drop our copy
+            // if this was still the live source.
+            wl_data_source::Event::Cancelled => {
+                if state.data_source.as_ref() == Some(source) {
+                    state.data_source = None;
+                    state.clipboard = None;
+                }
+                source.destroy();
+            }
+            _ => {}
+        }
+    }
+}
+
+delegate_noop!(Platform: ignore wl_data_device_manager::WlDataDeviceManager);
 delegate_noop!(Platform: ignore zwp_pointer_gestures_v1::ZwpPointerGesturesV1);
 delegate_noop!(Platform: ignore wl_compositor::WlCompositor);
 delegate_noop!(Platform: ignore wl_shm::WlShm);

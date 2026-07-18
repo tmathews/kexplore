@@ -10,10 +10,8 @@ mod textfield;
 mod ui;
 
 use std::ffi::OsStr;
-use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ash::vk;
@@ -169,6 +167,7 @@ fn main() {
     let mut extra_uploads: Vec<PendingUpload> = Vec::new();
     let mut frame_counter: u64 = 0;
 
+    let qh = queue.handle();
     let start = Instant::now();
     let mut last_frame = Instant::now();
     let mut dirty = true;
@@ -310,19 +309,19 @@ fn main() {
                     UrlOutcome::Cancel => dirty = true,
                     UrlOutcome::Copy => {
                         if let Some(t) = ui.url.selected_text() {
-                            clipboard_copy(t, &mut children);
+                            platform.set_clipboard(&qh, t.to_owned());
                         }
                     }
                     UrlOutcome::Cut => {
                         if let Some(t) = ui.url.selected_text().map(str::to_owned) {
-                            clipboard_copy(&t, &mut children);
+                            platform.set_clipboard(&qh, t);
                             ui.url.delete_selection();
                             blink_epoch = Instant::now();
                             dirty = true;
                         }
                     }
                     UrlOutcome::Paste => {
-                        if let Some(t) = clipboard_paste() {
+                        if let Some(t) = platform.clipboard_text(&conn) {
                             ui.url.insert(&t);
                             blink_epoch = Instant::now();
                             dirty = true;
@@ -404,6 +403,12 @@ fn main() {
                 {
                     navigate_to(&mut arena, &mut ui, &mut ts, root, &parent, window);
                     dirty = true;
+                }
+            } else if matches!(action, Action::CopyPath) {
+                // Copy the selected path onto the native clipboard (held until
+                // another client takes the selection).
+                if let Some(p) = ui.selected_path.as_ref().map(|p| p.to_string_lossy().into_owned()) {
+                    platform.set_clipboard(&qh, p);
                 }
             } else {
                 handle_action(
@@ -701,36 +706,6 @@ fn open_child_sync(
     Some(child_id)
 }
 
-/// Clipboard via wl-copy/wl-paste (same tools the toolbar copy button
-/// uses); wl-copy lingers to serve the selection and gets reaped like any
-/// other child.
-fn clipboard_copy(text: &str, children: &mut Vec<std::process::Child>) {
-    let child = Command::new("wl-copy")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    match child {
-        Ok(mut child) => {
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(text.as_bytes()).ok();
-            }
-            children.push(child);
-        }
-        Err(e) => eprintln!("wl-copy failed: {e}"),
-    }
-}
-
-fn clipboard_paste() -> Option<String> {
-    let out = Command::new("wl-paste").arg("--no-newline").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-    s.retain(|c| !c.is_control());
-    Some(s)
-}
-
 fn make_preview_texture(
     gfx: &gfx::Gfx,
     renderer: &Renderer2d,
@@ -853,17 +828,6 @@ fn handle_action(
                 }
             }
         }
-        Action::CopyPath => {
-            // Arg-vector spawn: paths with spaces survive (the C
-            // string_concat version broke them).
-            if let Some(p) = &ui.selected_path {
-                if let Err(e) =
-                    handlers::spawn(OsStr::new("wl-copy"), &[p.as_os_str()], children)
-                {
-                    eprintln!("wl-copy failed: {e}");
-                }
-            }
-        }
         Action::OpenTerminal => {
             // The C app passed the selected *file* to foot -D, which foot
             // rejects; use its directory.
@@ -878,13 +842,15 @@ fn handle_action(
                 }
             }
         }
-        // UrlBar, FocusHome and GoUp are handled inline in the main loop (they
-        // need text/caret state or navigate_to); ResizePreview is press-driven.
+        // UrlBar, FocusHome, GoUp and CopyPath are handled inline in the main
+        // loop (they need text/caret state, navigate_to, or the platform
+        // clipboard); ResizePreview is press-driven.
         Action::NodeBody
         | Action::None
         | Action::UrlBar
         | Action::FocusHome
         | Action::GoUp
+        | Action::CopyPath
         | Action::ResizePreview { .. } => {}
     }
 }
