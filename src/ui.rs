@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::geom::{Point, Rect};
 use crate::gfx::renderer2d::{DrawList, Rgba, TexSlot};
-use crate::model::{FileView, NodeArena, NodeId, HEADER_H, ROW_ICON, ROW_ICON_GAP};
+use crate::model::{FileView, Node, NodeArena, NodeId, HEADER_H, ROW_ICON, ROW_ICON_GAP};
 use crate::platform::wayland::PointerState;
 use crate::text::{Icon, TextSystem};
 use crate::textfield::TextField;
@@ -455,17 +455,26 @@ impl Ui {
                     dirty = true;
                 }
                 DragState::Resize(id) => {
-                    // Free resize from the corner: both dimensions follow the
-                    // world-space cursor. Any node is resizable; images inside a
-                    // file node letterbox into the space, directories scroll.
+                    // Resize from the corner, following the world-space cursor.
+                    // File nodes resize freely (the image letterboxes); directory
+                    // nodes resize vertically only — their width stays fit to the
+                    // content so filenames never clip — and never taller than
+                    // their content (no empty space below the last row).
                     if let Some(node) = arena.get_mut(id) {
-                        let world_x = cursor.x / self.zoom + self.camera.x;
                         let world_y = cursor.y / self.zoom + self.camera.y;
-                        let new_w = (world_x - node.rect.min.x).max(PREVIEW_MIN_W);
-                        let new_h = (world_y - node.rect.min.y).max(HEADER_H + 30.0);
                         node.anim_to = None;
-                        node.rect.max = Point::new(node.rect.min.x + new_w, node.rect.min.y + new_h);
                         node.user_sized = true;
+                        if node.file.is_some() {
+                            let world_x = cursor.x / self.zoom + self.camera.x;
+                            let new_w = (world_x - node.rect.min.x).max(PREVIEW_MIN_W);
+                            let new_h = (world_y - node.rect.min.y).max(HEADER_H + 30.0);
+                            node.rect.max = Point::new(node.rect.min.x + new_w, node.rect.min.y + new_h);
+                        } else {
+                            let max_h = node.content_h.max(HEADER_H + 30.0);
+                            let new_h =
+                                (world_y - node.rect.min.y).clamp(HEADER_H + 30.0, max_h);
+                            node.rect.max.y = node.rect.min.y + new_h;
+                        }
                         dirty = true;
                     }
                 }
@@ -777,6 +786,21 @@ fn draw_curve(list: &mut DrawList, view: View, a: Point, b: Point, width: f32, c
     }
 }
 
+/// Fit a directory box each frame: width always tracks the content; height fits
+/// the content unless the user has resized it, in which case the user's height
+/// is kept (capped to the content so no empty space shows below the last row).
+/// Also re-clamps the scroll offset to the resulting box.
+fn clamp_dir_box(node: &mut Node, cap: Point) {
+    let box_w = node.content_w.min(cap.x);
+    let box_h = if node.user_sized {
+        node.rect.height().clamp(HEADER_H + 30.0, node.content_h.max(HEADER_H + 30.0))
+    } else {
+        node.content_h.min(cap.y)
+    };
+    node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
+    node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
+}
+
 /// Re-clamp every node and emit the parent→child connector wires. Kept
 /// separate from `draw_entries` so all wires land in the draw list before any
 /// box, guaranteeing they render beneath the nodes.
@@ -790,12 +814,10 @@ fn draw_connectors(
 ) {
     let (node_rect, scroll) = {
         let Some(node) = arena.get_mut(id) else { return };
-        // File nodes are user-sized; only directory boxes get re-clamped.
+        // Directory boxes fit their content; a user-resized box keeps its height
+        // but still fits its width. File nodes are entirely user-sized.
         if node.file.is_none() {
-            let box_w = node.content_w.min(cap.x);
-            let box_h = node.content_h.min(cap.y);
-            node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
-            node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
+            clamp_dir_box(node, cap);
         }
         (node.rect, node.scroll)
     };
@@ -948,13 +970,7 @@ fn draw_entries(
         let Some(node) = arena.get_mut(id) else { return };
         let file_view = node.file.clone();
         if file_view.is_none() {
-            if !node.user_sized {
-                let box_w = node.content_w.min(cap.x);
-                let box_h = node.content_h.min(cap.y);
-                node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
-            }
-            let box_h = node.rect.height();
-            node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
+            clamp_dir_box(node, cap);
         }
         let favorited = ui.favorites.contains(&node.path);
         let pinned = node.pinned;
