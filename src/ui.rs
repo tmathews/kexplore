@@ -214,6 +214,17 @@ impl Ui {
         }
     }
 
+    /// Apply a pinch zoom `factor` immediately (the gesture is continuous, so
+    /// it isn't smoothed), keeping the world point under `cursor` fixed.
+    pub fn pinch_zoom(&mut self, cursor: Point, factor: f32) {
+        self.refocus = false;
+        let pivot_world = cursor.scale(1.0 / self.zoom).add(self.camera);
+        let new_zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        self.zoom = new_zoom;
+        self.zoom_target = new_zoom;
+        self.camera = pivot_world.sub(cursor.scale(1.0 / new_zoom));
+    }
+
     /// Queue a smooth zoom by `notches` wheel steps, keeping the world point
     /// under `cursor` (screen px) fixed as the zoom animates.
     pub fn zoom_at(&mut self, cursor: Point, notches: f32) {
@@ -278,23 +289,42 @@ impl Ui {
             dirty = true;
         }
 
-        // Mouse wheel: scroll a hovered node that has overflow, otherwise zoom
-        // the canvas about the cursor (smoothed).
-        let wheel = pointer.scroll_delta as f32;
-        if wheel != 0.0 {
-            let scrolled = hit.and_then(|h| h.drag.node()).and_then(|id| {
-                arena.get_mut(id).and_then(|node| {
-                    let max_scroll = (node.content_h - node.rect.height()).max(0.0);
-                    (max_scroll > 0.0).then(|| {
-                        node.scroll = (node.scroll + wheel * 3.0).clamp(0.0, max_scroll);
+        // Touchpad pinch: zoom about the cursor, applied immediately (the
+        // gesture is already continuous, so no extra smoothing).
+        if pointer.pinch > 0.0 && (pointer.pinch - 1.0).abs() > 0.0001 {
+            self.pinch_zoom(cursor, pointer.pinch as f32);
+            dirty = true;
+        }
+
+        // Scroll. Over an overflowing node, vertical scroll scrolls it.
+        // Otherwise a touchpad 2-finger swipe pans the canvas, while a mouse
+        // wheel zooms about the cursor.
+        let dx = pointer.scroll_dx as f32;
+        let dy = pointer.scroll_dy as f32;
+        if dx != 0.0 || dy != 0.0 {
+            let node_scrolled = dy != 0.0
+                && hit
+                    .and_then(|h| h.drag.node())
+                    .and_then(|id| {
+                        arena.get_mut(id).and_then(|node| {
+                            let max_scroll = (node.content_h - node.rect.height()).max(0.0);
+                            (max_scroll > 0.0).then(|| {
+                                let step = if pointer.scroll_finger { 1.0 } else { 3.0 };
+                                node.scroll = (node.scroll + dy * step).clamp(0.0, max_scroll);
+                            })
+                        })
                     })
-                })
-            });
-            if scrolled.is_some() {
+                    .is_some();
+            if node_scrolled {
+                dirty = true;
+            } else if pointer.scroll_finger {
+                // 2-finger pan (world delta = scroll / zoom).
+                self.camera = self.camera.add(Point::new(dx, dy).scale(1.0 / self.zoom));
+                self.refocus = false;
                 dirty = true;
             } else {
                 // One wheel notch ~= 15 logical px; zoom in on scroll-up.
-                self.zoom_at(cursor, -wheel / 15.0);
+                self.zoom_at(cursor, -dy / 15.0);
                 dirty = true;
             }
         }

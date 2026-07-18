@@ -19,6 +19,9 @@ use wayland_cursor::CursorTheme;
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
 };
+use wayland_protocols::wp::pointer_gestures::zv1::client::{
+    zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
+};
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
@@ -38,9 +41,15 @@ pub struct PointerState {
     /// Middle button: held / just-pressed this iteration (canvas pan).
     pub middle_down: bool,
     pub middle_pressed: bool,
-    /// Accumulated vertical wheel/scroll motion this iteration (logical px,
-    /// positive = scroll down).
-    pub scroll_delta: f64,
+    /// Accumulated scroll this iteration (positive dy = down, dx = right).
+    pub scroll_dx: f64,
+    pub scroll_dy: f64,
+    /// True when this iteration's scroll came from a touchpad (2-finger)
+    /// rather than a mouse wheel.
+    pub scroll_finger: bool,
+    /// Net multiplicative zoom from a pinch gesture this iteration; 0.0 means
+    /// no pinch (a real factor is >0, e.g. 1.05 to zoom in a little).
+    pub pinch: f64,
 }
 
 /// A resolved key press (or repeat) ready for the UI to consume.
@@ -78,6 +87,12 @@ pub struct Platform {
     _fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     _decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     pointer: Option<wl_pointer::WlPointer>,
+    gestures: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
+    _pinch: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
+    /// Axis source of the scroll frame currently being assembled (finger vs
+    /// wheel), and the last absolute pinch scale (updates are relative to it).
+    scroll_source_finger: bool,
+    pinch_last_scale: f64,
     keyboard: Option<Keyboard>,
     /// Resolved key presses/repeats, drained by the main loop.
     pub key_events: Vec<KeyEvent>,
@@ -125,6 +140,8 @@ pub fn init(title: &str, app_id: &str, logical: (u32, u32)) -> Result<Init, Stri
     let fs_mgr: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1> =
         globals.bind(&qh, 1..=1, ()).ok();
     let viewporter: Option<wp_viewporter::WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
+    let gestures: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1> =
+        globals.bind(&qh, 1..=3, ()).ok();
 
     // Bind every output so we can track integer scales for the fallback chain.
     let mut outputs = Vec::new();
@@ -163,6 +180,10 @@ pub fn init(title: &str, app_id: &str, logical: (u32, u32)) -> Result<Init, Stri
         _fractional: fractional,
         _decoration: decoration,
         pointer: None,
+        gestures,
+        _pinch: None,
+        scroll_source_finger: false,
+        pinch_last_scale: 1.0,
         keyboard: None,
         key_events: Vec::new(),
         cursor_theme,
@@ -238,7 +259,10 @@ impl Platform {
         self.pointer_state.pressed = false;
         self.pointer_state.released = false;
         self.pointer_state.middle_pressed = false;
-        self.pointer_state.scroll_delta = 0.0;
+        self.pointer_state.scroll_dx = 0.0;
+        self.pointer_state.scroll_dy = 0.0;
+        self.pointer_state.scroll_finger = false;
+        self.pointer_state.pinch = 0.0;
     }
 
     /// When the next key repeat is due, if a repeating key is held.
@@ -431,7 +455,12 @@ impl Dispatch<wl_seat::WlSeat, ()> for Platform {
     ) {
         if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = event {
             if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
-                state.pointer = Some(seat.get_pointer(qh, ()));
+                let pointer = seat.get_pointer(qh, ());
+                // Touchpad pinch-to-zoom, if the compositor supports gestures.
+                if let Some(g) = &state.gestures {
+                    state._pinch = Some(g.get_pinch_gesture(&pointer, qh, ()));
+                }
+                state.pointer = Some(pointer);
             }
             if caps.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
                 state.keyboard = Some(Keyboard {
@@ -578,8 +607,26 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Platform {
                     }
                 }
             }
-            wl_pointer::Event::Axis { axis: WEnum::Value(wl_pointer::Axis::VerticalScroll), value, .. } => {
-                state.pointer_state.scroll_delta += value;
+            // AxisSource precedes the Axis events of a scroll frame; it tells
+            // us whether the scroll is a mouse wheel or a touchpad 2-finger
+            // swipe (which we pan with, not zoom).
+            wl_pointer::Event::AxisSource { axis_source: WEnum::Value(src) } => {
+                state.scroll_source_finger =
+                    matches!(src, wl_pointer::AxisSource::Finger | wl_pointer::AxisSource::Continuous);
+            }
+            wl_pointer::Event::Axis { axis: WEnum::Value(axis), value, .. } => {
+                match axis {
+                    wl_pointer::Axis::VerticalScroll => state.pointer_state.scroll_dy += value,
+                    wl_pointer::Axis::HorizontalScroll => state.pointer_state.scroll_dx += value,
+                    _ => {}
+                }
+                state.pointer_state.scroll_finger = state.scroll_source_finger;
+            }
+            // Reset the source at each frame boundary so a scroll with no
+            // AxisSource (or the next wheel after a touchpad) defaults to wheel
+            // rather than reusing the previous frame's source.
+            wl_pointer::Event::Frame => {
+                state.scroll_source_finger = false;
             }
             wl_pointer::Event::Leave { .. } => {
                 state.pointer_state.is_down = false;
@@ -590,6 +637,34 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Platform {
     }
 }
 
+impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()> for Platform {
+    fn event(
+        state: &mut Self,
+        _: &zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
+        event: zwp_pointer_gesture_pinch_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwp_pointer_gesture_pinch_v1::Event;
+        match event {
+            // `scale` is the absolute scale since the gesture began (1.0 at
+            // start); accumulate the per-update factor into this frame's pinch.
+            Event::Begin { .. } | Event::End { .. } => state.pinch_last_scale = 1.0,
+            Event::Update { scale, .. } => {
+                if state.pinch_last_scale > 0.0 && scale > 0.0 {
+                    let factor = scale / state.pinch_last_scale;
+                    let acc = &mut state.pointer_state.pinch;
+                    *acc = if *acc == 0.0 { factor } else { *acc * factor };
+                }
+                state.pinch_last_scale = scale;
+            }
+            _ => {}
+        }
+    }
+}
+
+delegate_noop!(Platform: ignore zwp_pointer_gestures_v1::ZwpPointerGesturesV1);
 delegate_noop!(Platform: ignore wl_compositor::WlCompositor);
 delegate_noop!(Platform: ignore wl_shm::WlShm);
 delegate_noop!(Platform: ignore wp_viewporter::WpViewporter);
