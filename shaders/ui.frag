@@ -8,6 +8,10 @@ layout(location = 3) in vec4 v_extra;
 
 layout(set = 0, binding = 0) uniform sampler2D tex;
 
+layout(push_constant) uniform PC {
+    vec2 viewport; // physical pixels
+} pc;
+
 layout(location = 0) out vec4 out_color; // premultiplied
 
 const uint MODE_SOLID = 0u;
@@ -15,6 +19,7 @@ const uint MODE_RRECT_FILL = 1u;
 const uint MODE_RRECT_BORDER = 2u;
 const uint MODE_GLYPH = 3u;
 const uint MODE_IMAGE = 4u;
+const uint MODE_IMAGE_RRECT = 5u;
 
 // Signed distance to a rounded rect centered at origin.
 float rrect_sd(vec2 p, vec2 half_size, float radius) {
@@ -34,6 +39,13 @@ void main() {
         c.a *= textureLod(tex, v_uv, 0.0).r;
     } else if (v_mode == MODE_IMAGE) {
         out_color = textureLod(tex, v_uv, 0.0); // uploaded premultiplied
+        return;
+    } else if (v_mode == MODE_IMAGE_RRECT) {
+        // Full-screen texture (UV from screen position) through a rounded mask.
+        vec2 uv = gl_FragCoord.xy / pc.viewport;
+        vec4 tc = textureLod(tex, uv, 0.0); // premultiplied
+        float sd = rrect_sd(v_uv, v_extra.xy, v_extra.z);
+        out_color = tc * clamp(0.5 - sd, 0.0, 1.0);
         return;
     }
     out_color = vec4(c.rgb * c.a, c.a);

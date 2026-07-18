@@ -786,18 +786,8 @@ fn draw_context_menu(ui: &mut Ui, ts: &mut TextSystem, list: &mut DrawList, wind
         };
         list.rect(sr, Rgba::new(0.0, 0.0, 0.0, 0.10), MENU_RADIUS + s);
     }
-    // Blurred backdrop, inset by the corner radius so its rectangular quad stays
-    // within the rounded shape (no sharp corners poking out).
-    let inset = inflate(rect, -MENU_RADIUS);
-    if inset.max.x > inset.min.x && inset.max.y > inset.min.y {
-        let uv = [
-            inset.min.x / window.x,
-            inset.min.y / window.y,
-            inset.max.x / window.x,
-            inset.max.y / window.y,
-        ];
-        list.image_slot_uv(inset, TexSlot::Blur, uv);
-    }
+    // Blurred backdrop through a rounded mask (reaches the rounded edge).
+    list.image_rrect(rect, TexSlot::Blur, MENU_RADIUS);
     // Frosted fill + border.
     list.rect(rect, MENU_BG, MENU_RADIUS);
     list.rect_stroke(rect, MENU_BORDER, MENU_RADIUS, 1.0);
@@ -1058,17 +1048,11 @@ fn fit_rect(region: Rect, aspect: f32) -> Rect {
 /// Corner radius shared by node boxes and their frosted backdrops.
 const NODE_RADIUS: f32 = 5.0;
 
-/// Frost the background behind a node box: sample the blurred scene over the box
-/// (inset by the corner radius so the rectangular sample stays inside the
-/// rounded shape). Softens the grid and connector lines passing beneath it.
-fn draw_node_backdrop(list: &mut DrawList, view: View, screen_rect: Rect) {
-    let inset = inflate(screen_rect, -NODE_RADIUS);
-    if inset.max.x <= inset.min.x || inset.max.y <= inset.min.y {
-        return;
-    }
-    let w = view.window;
-    let uv = [inset.min.x / w.x, inset.min.y / w.y, inset.max.x / w.x, inset.max.y / w.y];
-    list.image_slot_uv(inset, TexSlot::Blur, uv);
+/// Frost the background behind a node box: the blurred scene sampled through a
+/// rounded-rect mask over the whole box, so it reaches the rounded edge with no
+/// inset gap. Softens the grid and connector lines passing beneath it.
+fn draw_node_backdrop(list: &mut DrawList, screen_rect: Rect) {
+    list.image_rrect(screen_rect, TexSlot::Blur, NODE_RADIUS);
 }
 
 /// Draw a node's bottom-right corner resize handle (two short edge lines) and
@@ -1159,7 +1143,7 @@ fn draw_entries(
     if let Some(fv) = file_view {
         if visible.intersects(node_rect) {
             let screen = view.w2s_rect(node_rect);
-            draw_node_backdrop(list, view, screen);
+            draw_node_backdrop(list, screen);
             list.rect(screen, COLOR_BOX_FILL, 5.0);
             let info_h = file_info_height(ts);
             let info_top = (node_rect.max.y - info_h).max(node_rect.min.y + HEADER_H);
@@ -1203,7 +1187,7 @@ fn draw_entries(
 
     if visible.intersects(node_rect) {
         let screen_rect = view.w2s_rect(node_rect);
-        draw_node_backdrop(list, view, screen_rect);
+        draw_node_backdrop(list, screen_rect);
         list.rect(screen_rect, COLOR_BOX_FILL, 5.0);
         let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
         list.rect_stroke(screen_rect, border, 5.0, 3.0);

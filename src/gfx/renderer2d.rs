@@ -13,6 +13,9 @@ pub const MODE_RRECT_FILL: u32 = 1;
 pub const MODE_RRECT_BORDER: u32 = 2;
 pub const MODE_GLYPH: u32 = 3;
 pub const MODE_IMAGE: u32 = 4;
+/// A full-screen texture sampled through a rounded-rect mask (via gl_FragCoord),
+/// for a rounded frosted backdrop with no inset gap.
+pub const MODE_IMAGE_RRECT: u32 = 5;
 
 /// Anti-aliasing margin added around SDF quads, in physical pixels.
 const AA_MARGIN: f32 = 1.0;
@@ -248,6 +251,24 @@ impl DrawList {
         self.image_slot_uv(r, slot, [0.0, 0.0, 1.0, 1.0]);
     }
 
+    /// A full-screen `slot` texture (blur/scene) drawn through a rounded-rect
+    /// mask over `r`. The texture UV is derived per-fragment from screen
+    /// position, so the frosted backdrop reaches the rounded edge with no inset.
+    pub fn image_rrect(&mut self, r: Rect, slot: TexSlot, radius: f32) {
+        self.require_tex(slot);
+        let s = self.scale;
+        let half = [r.width() * 0.5 * s, r.height() * 0.5 * s];
+        let center = [r.center().x * s, r.center().y * s];
+        self.sdf_quad(
+            center,
+            half,
+            AA_MARGIN,
+            Rgba::WHITE,
+            MODE_IMAGE_RRECT,
+            [half[0], half[1], radius * s, 0.0],
+        );
+    }
+
     /// Textured quad sampling `slot` over the UV sub-region `uv` = [u0,v0,u1,v1]
     /// (0..1). Used to sample a region of the full-screen blur behind a panel.
     pub fn image_slot_uv(&mut self, r: Rect, slot: TexSlot, uv: [f32; 4]) {
@@ -344,7 +365,7 @@ impl Renderer2d {
             .map_err(|e| format!("sampler: {e}"))?;
 
         let pc_range = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .size(8);
         let set_layouts = [desc_layout];
         let pipeline_layout = device
@@ -617,7 +638,7 @@ impl Renderer2d {
             device.cmd_push_constants(
                 cmd,
                 self.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytemuck::cast_slice(&viewport),
             );
