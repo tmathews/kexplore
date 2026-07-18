@@ -295,11 +295,13 @@ impl TextSystem {
     /// Pango draw_text2 did. Returns the advance width in logical px.
     #[allow(dead_code)]
     pub fn draw(&mut self, list: &mut DrawList, origin: Point, s: &str, color: Rgba) -> f32 {
-        self.draw_impl(list, origin, s, color, None)
+        self.draw_impl(list, origin, s, color, None, 1.0)
     }
 
-    /// Like `draw`, but glyphs are clipped to `clip` (logical px): partial
-    /// glyphs get their quad and uv trimmed proportionally.
+    /// Like `draw`, but glyphs are clipped to `clip` (logical px) and scaled by
+    /// `zoom` (canvas zoom): the atlas is rasterized at the base scale and
+    /// glyphs are drawn `zoom`× larger, so `origin`/`clip` are the already
+    /// zoomed screen positions while sizes come from this factor.
     pub fn draw_clipped(
         &mut self,
         list: &mut DrawList,
@@ -307,8 +309,9 @@ impl TextSystem {
         s: &str,
         color: Rgba,
         clip: crate::geom::Rect,
+        zoom: f32,
     ) -> f32 {
-        self.draw_impl(list, origin, s, color, Some(clip))
+        self.draw_impl(list, origin, s, color, Some(clip), zoom)
     }
 
     fn draw_impl(
@@ -318,46 +321,52 @@ impl TextSystem {
         s: &str,
         color: Rgba,
         clip: Option<crate::geom::Rect>,
+        zoom: f32,
     ) -> f32 {
         let scale = self.scale;
         let clip_phys = clip.map(|c| [c.min.x * scale, c.min.y * scale, c.max.x * scale, c.max.y * scale]);
-        let baseline_y = (origin.y + self.ascent()) * scale;
+        // origin is a screen-logical position (already includes zoom offset);
+        // the text block's internal layout scales by `zoom`.
+        let baseline_y = origin.y * scale + self.ascent() * scale * zoom;
         let mut pen_x = origin.x * scale;
         let start_x = pen_x;
         for ch in s.chars() {
             let Some(g) = self.glyph(ch) else { continue };
             if g.w > 0.0 && g.h > 0.0 {
-                let x = (pen_x + g.xmin).round();
-                let y = (baseline_y + g.ytop).round();
-                let mut r = [x, y, x + g.w, y + g.h];
+                // Glyph metrics are physical px at the base scale; draw them
+                // `zoom`× larger for the zoomed canvas.
+                let (gw, gh) = (g.w * zoom, g.h * zoom);
+                let x = (pen_x + g.xmin * zoom).round();
+                let y = (baseline_y + g.ytop * zoom).round();
+                let mut r = [x, y, x + gw, y + gh];
                 let mut uv = g.uv;
                 if let Some(c) = clip_phys {
                     if r[0] >= c[2] || r[2] <= c[0] || r[1] >= c[3] || r[3] <= c[1] {
-                        pen_x += g.advance;
+                        pen_x += g.advance * zoom;
                         continue;
                     }
                     // Trim quad to the clip rect, adjusting uv linearly.
                     let (uw, uh) = (uv[2] - uv[0], uv[3] - uv[1]);
                     if r[0] < c[0] {
-                        uv[0] += uw * (c[0] - r[0]) / g.w;
+                        uv[0] += uw * (c[0] - r[0]) / gw;
                         r[0] = c[0];
                     }
                     if r[2] > c[2] {
-                        uv[2] -= uw * (r[2] - c[2]) / g.w;
+                        uv[2] -= uw * (r[2] - c[2]) / gw;
                         r[2] = c[2];
                     }
                     if r[1] < c[1] {
-                        uv[1] += uh * (c[1] - r[1]) / g.h;
+                        uv[1] += uh * (c[1] - r[1]) / gh;
                         r[1] = c[1];
                     }
                     if r[3] > c[3] {
-                        uv[3] -= uh * (r[3] - c[3]) / g.h;
+                        uv[3] -= uh * (r[3] - c[3]) / gh;
                         r[3] = c[3];
                     }
                 }
                 list.glyph_quad_phys(r, uv, color);
             }
-            pen_x += g.advance;
+            pen_x += g.advance * zoom;
         }
         (pen_x - start_x) / scale
     }

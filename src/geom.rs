@@ -19,6 +19,10 @@ impl Point {
         Point::new(self.x - o.x, self.y - o.y)
     }
 
+    pub fn scale(self, s: f32) -> Point {
+        Point::new(self.x * s, self.y * s)
+    }
+
     pub fn lerp(self, target: Point, t: f32) -> Point {
         Point::new(self.x + (target.x - self.x) * t, self.y + (target.y - self.y) * t)
     }
@@ -39,10 +43,6 @@ impl Rect {
 
     pub fn from_xywh(x: f32, y: f32, w: f32, h: f32) -> Rect {
         Rect { min: Point::new(x, y), max: Point::new(x + w, y + h) }
-    }
-
-    pub fn size(self) -> Point {
-        self.max.sub(self.min)
     }
 
     pub fn width(self) -> f32 {

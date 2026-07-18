@@ -26,6 +26,7 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 pub const BTN_LEFT: u32 = 272;
+pub const BTN_MIDDLE: u32 = 274;
 
 #[derive(Clone, Copy, Default)]
 pub struct PointerState {
@@ -34,6 +35,9 @@ pub struct PointerState {
     pub is_down: bool,
     pub pressed: bool,
     pub released: bool,
+    /// Middle button: held / just-pressed this iteration (canvas pan).
+    pub middle_down: bool,
+    pub middle_pressed: bool,
     /// Accumulated vertical wheel/scroll motion this iteration (logical px,
     /// positive = scroll down).
     pub scroll_delta: f64,
@@ -233,6 +237,7 @@ impl Platform {
     pub fn end_input_frame(&mut self) {
         self.pointer_state.pressed = false;
         self.pointer_state.released = false;
+        self.pointer_state.middle_pressed = false;
         self.pointer_state.scroll_delta = 0.0;
     }
 
@@ -560,6 +565,17 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Platform {
                         }
                         _ => {}
                     }
+                } else if button == BTN_MIDDLE {
+                    match btn_state {
+                        WEnum::Value(wl_pointer::ButtonState::Pressed) => {
+                            state.pointer_state.middle_down = true;
+                            state.pointer_state.middle_pressed = true;
+                        }
+                        WEnum::Value(wl_pointer::ButtonState::Released) => {
+                            state.pointer_state.middle_down = false;
+                        }
+                        _ => {}
+                    }
                 }
             }
             wl_pointer::Event::Axis { axis: WEnum::Value(wl_pointer::Axis::VerticalScroll), value, .. } => {
@@ -567,6 +583,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Platform {
             }
             wl_pointer::Event::Leave { .. } => {
                 state.pointer_state.is_down = false;
+                state.pointer_state.middle_down = false;
             }
             _ => {}
         }

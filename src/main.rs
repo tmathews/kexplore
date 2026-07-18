@@ -386,7 +386,9 @@ fn main() {
         let now = Instant::now();
         let dt = (now - last_frame).as_secs_f32().min(0.1);
         last_frame = now;
-        if ui.step_camera(dt) {
+        // Camera pan + zoom smoothing.
+        let cam_moving = ui.step_camera(dt);
+        if cam_moving {
             dirty = true;
         }
         // Collision glide: nodes slide to their resolved positions.
@@ -425,7 +427,7 @@ fn main() {
                 spin_angle,
                 caret_visible,
             );
-            animating = out.animating || ui.refocus || nodes_moving;
+            animating = out.animating || cam_moving || nodes_moving;
 
             let mut uploads = std::mem::take(&mut ts.pending);
             uploads.append(&mut extra_uploads);
