@@ -227,20 +227,22 @@ fn main() {
         while let Ok(result) = tasks.rx.try_recv() {
             match result {
                 TaskResult::PreviewDone { node, item, path, image } => {
-                    // Only attach if the item is still loading, has no child,
-                    // and is still the current selection (a transient preview
-                    // belongs to whatever is selected right now).
-                    let attach = arena
-                        .get(node)
-                        .and_then(|n| n.items.get(item))
-                        .is_some_and(|it| it.preview_loading && it.child.is_none())
-                        && ui.selection == Some((node, item));
                     if let Some(n) = arena.get_mut(node) {
                         if let Some(it) = n.items.get_mut(item) {
                             it.preview_loading = false;
                         }
                     }
-                    if let (true, Some(img)) = (attach, image) {
+                    // Attach to the file node we opened for this row, but only if
+                    // it's still the same file with no image yet (the user may
+                    // have clicked away, closing the transient node).
+                    let child = arena
+                        .get(node)
+                        .and_then(|n| n.items.get(item))
+                        .and_then(|it| it.child);
+                    let attach = child.and_then(|c| arena.get(c)).is_some_and(|c| {
+                        c.path == path && c.file.is_some_and(|f| f.image.is_none())
+                    });
+                    if let (true, Some(child_id), Some(img)) = (attach, child, image) {
                         match make_preview_texture(&gfx, &renderer, &img) {
                             Ok((tex, set)) => {
                                 extra_uploads.push(PendingUpload {
@@ -255,10 +257,9 @@ fn main() {
                                 let tex_id = ptex.alloc(tex, set);
                                 let (lw, lh) = platform.logical_size;
                                 let win = Point::new(lw as f32, lh as f32);
-                                // Auto-opened previews start transient (unpinned).
-                                spawn_preview_node(
-                                    &mut arena, &mut ui, node, item, path, tex_id,
-                                    img.width, img.height, false, win,
+                                attach_image(
+                                    &mut arena, &mut ui, child_id, tex_id, img.width, img.height,
+                                    win,
                                 );
                             }
                             Err(e) => eprintln!("preview texture failed: {e}"),
@@ -342,15 +343,13 @@ fn main() {
                 }
             }
         } else {
-            // Canvas keys: Space pins the selected item's transient preview.
+            // Canvas keys: Space pins the active file node (keeps it open).
             for ev in &key_events {
                 if ev.keysym.raw() == ks::KEY_space {
-                    if let Some(child) = ui.selection.and_then(|(node, item)| {
-                        arena.get(node).and_then(|n| n.items.get(item)).and_then(|it| it.child)
-                    }) {
-                        if let Some(n) = arena.get_mut(child) {
-                            if let Some(pv) = &mut n.preview {
-                                pv.pinned = true;
+                    if let Some(active) = ui.active_node {
+                        if let Some(n) = arena.get_mut(active) {
+                            if let Some(f) = &mut n.file {
+                                f.pinned = true;
                                 dirty = true;
                             }
                         }
@@ -501,9 +500,11 @@ fn main() {
             });
             if recorded {
                 frame_counter += 1;
-                // Free textures of any preview node that was closed.
-                let live: HashSet<u32> =
-                    arena.iter().filter_map(|(_, n)| n.preview.map(|p| p.tex)).collect();
+                // Free textures of any file node that was closed.
+                let live: HashSet<u32> = arena
+                    .iter()
+                    .filter_map(|(_, n)| n.file.and_then(|f| f.image).map(|img| img.tex))
+                    .collect();
                 ptex.retire_unused(&live, frame_counter);
                 ptex.destroy_old(&gfx.device, &renderer, frame_counter);
             } else {
@@ -624,14 +625,13 @@ fn navigate_to(
         })
         .collect();
 
-    // Target is the root itself: just focus it.
+    // Target is the root itself: focus and activate it.
     if comps.is_empty() {
         if let Some(n) = arena.get(root) {
             let r = n.rect;
             ui.focus_to_rect(r, window);
         }
-        ui.selection = None;
-        ui.selected_path = Some(root_path);
+        ui.set_active(arena, Some(root));
         return true;
     }
 
@@ -645,8 +645,6 @@ fn navigate_to(
         };
         let is_dir = node.items[idx].is_dir;
         cur_path = cur_path.join(comp);
-        ui.selection = Some((current, idx));
-        ui.selected_path = Some(cur_path.clone());
 
         if is_dir {
             // Reuse the already-open child, or open it synchronously.
@@ -658,19 +656,27 @@ fn navigate_to(
                 },
             };
             if i == last {
-                // Target directory: focus its node.
+                // Target directory: focus and activate its node.
                 if let Some(n) = arena.get(child) {
                     let r = n.rect;
                     ui.focus_to_rect(r, window);
                 }
+                ui.set_active(arena, Some(child));
             } else {
                 current = child;
             }
         } else {
-            // Target file (must be the last component): focus its parent node.
-            if let Some(n) = arena.get(current) {
-                let r = n.rect;
-                ui.focus_to_rect(r, window);
+            // Target file (must be the last component): open/focus its file node.
+            let fnode = match arena.get(current).and_then(|n| n.items[idx].child) {
+                Some(c) => Some(c),
+                None => open_file_node(arena, ui, current, idx, cur_path.clone(), false, window),
+            };
+            if let Some(fid) = fnode {
+                if let Some(n) = arena.get(fid) {
+                    let r = n.rect;
+                    ui.focus_to_rect(r, window);
+                }
+                ui.set_active(arena, Some(fid));
             }
             break;
         }
@@ -744,25 +750,16 @@ fn handle_action(
         Action::Row { node, item } => {
             let Some(n) = arena.get(node) else { return };
             let Some(it) = n.items.get(item) else { return };
-            ui.selection = Some((node, item));
             let path = n.path.join(&it.name);
-            ui.selected_path = Some(path.clone());
             let is_dir = it.is_dir;
             let child = it.child;
             let scanning = it.scanning;
-            let preview_loading = it.preview_loading;
 
             if double {
-                // Double-click opens: directories scan into a node, files open
-                // with their configured handler (an external app).
-                if is_dir {
-                    if child.is_none() && !scanning {
-                        if let Some(n) = arena.get_mut(node) {
-                            n.items[item].scanning = true;
-                        }
-                        tasks.spawn_scan(node, item, path);
-                    }
-                } else {
+                // Double-click a file opens it in its external handler.
+                // Directories already open on single click, so double adds
+                // nothing for them.
+                if !is_dir {
                     match handlers::find_handler(file_handlers, &path) {
                         Some(h) => {
                             if let Err(e) = handlers::spawn_handler(h, &path, children) {
@@ -775,29 +772,57 @@ fn handle_action(
                 return;
             }
 
-            // Single click auto-opens a transient (unpinned) preview of a
-            // previewable file. Selecting anything else dismisses the current
-            // transient preview; an item that already has its own preview
-            // keeps it.
-            let has_preview =
-                child.map_or(false, |c| arena.get(c).is_some_and(|n| n.preview.is_some()));
-            if !has_preview {
-                close_unpinned_previews(arena);
-                if !is_dir && preview::previewable(&path) && !preview_loading {
+            // Single click opens (or focuses) the row's node and makes it
+            // active. Opening or focusing anything other than the current
+            // transient peek dismisses that peek.
+            let child_is_peek = child
+                .and_then(|c| arena.get(c))
+                .is_some_and(|c| c.file.is_some_and(|f| !f.pinned));
+            if !child_is_peek {
+                close_unpinned_files(arena);
+            }
+            if let Some(c) = child {
+                ui.set_active(arena, Some(c));
+                if let Some(r) = arena.get(c).map(|n| n.rect) {
+                    ui.ensure_visible(r, window);
+                }
+                return;
+            }
+            if is_dir {
+                // Directory: scan asynchronously; ScanDone activates the child.
+                if !scanning {
                     if let Some(n) = arena.get_mut(node) {
-                        n.items[item].preview_loading = true;
+                        n.items[item].scanning = true;
                     }
-                    tasks.spawn_preview(node, item, path);
+                    tasks.spawn_scan(node, item, path);
+                }
+            } else {
+                // File: open a fresh (unpinned) file node, activate it, and
+                // decode an image if the type supports it.
+                if let Some(child_id) =
+                    open_file_node(arena, ui, node, item, path.clone(), false, window)
+                {
+                    ui.set_active(arena, Some(child_id));
+                    if preview::previewable(&path) {
+                        if let Some(n) = arena.get_mut(node) {
+                            n.items[item].preview_loading = true;
+                        }
+                        tasks.spawn_preview(node, item, path);
+                    }
                 }
             }
         }
+        Action::NodeBody { node } => {
+            // Clicking a node makes it active (URL bar + route follow it).
+            ui.set_active(arena, Some(node));
+        }
         Action::CloseNode { node } => {
+            let parent = arena.get(node).and_then(|n| n.parent.map(|(p, _)| p));
             arena.close_recursive(node);
-            if let Some((sel_node, _)) = ui.selection {
-                if arena.get(sel_node).is_none() {
-                    ui.selection = None;
-                    ui.selected_path = None;
-                }
+            // If the active node was the one closed (or a now-dangling
+            // descendant), fall back to the closed node's parent.
+            if ui.active_node.map_or(false, |a| arena.get(a).is_none()) {
+                ui.set_active(arena, parent);
             }
         }
         Action::ToggleFavorite { node } => {
@@ -810,21 +835,15 @@ fn handle_action(
         }
         Action::PinPreview { node } => {
             if let Some(n) = arena.get_mut(node) {
-                if let Some(pv) = &mut n.preview {
-                    pv.pinned = true;
+                if let Some(f) = &mut n.file {
+                    f.pinned = true;
                 }
             }
         }
         Action::FocusSelection => {
-            if let Some((node, item)) = ui.selection {
-                if let Some(n) = arena.get(node) {
-                    if let Some(it) = n.items.get(item) {
-                        let r = it
-                            .rect
-                            .offset(n.rect.min)
-                            .offset(Point::new(0.0, -n.scroll));
-                        ui.focus_to_rect(r, window);
-                    }
+            if let Some(active) = ui.active_node {
+                if let Some(r) = arena.get(active).map(|n| n.rect) {
+                    ui.focus_to_rect(r, window);
                 }
             }
         }
@@ -845,8 +864,7 @@ fn handle_action(
         // UrlBar, FocusHome, GoUp and CopyPath are handled inline in the main
         // loop (they need text/caret state, navigate_to, or the platform
         // clipboard); ResizePreview is press-driven.
-        Action::NodeBody
-        | Action::None
+        Action::None
         | Action::UrlBar
         | Action::FocusHome
         | Action::GoUp
@@ -855,16 +873,12 @@ fn handle_action(
     }
 }
 
-/// Attach a decoded image as a preview node hanging off `(node, item)`: sized
-/// to the image aspect (capped to the safe area), placed to the right of the
-/// row like a directory child, and collision-resolved so it doesn't land on
-/// an existing node.
-/// Close every unpinned (transient) preview node. There is at most one at a
-/// time; it is dismissed whenever the selection moves.
-fn close_unpinned_previews(arena: &mut NodeArena) {
+/// Close every unpinned (transient) file node. There is at most one at a time;
+/// it is dismissed whenever the active file moves.
+fn close_unpinned_files(arena: &mut NodeArena) {
     let ids: Vec<NodeId> = arena
         .iter()
-        .filter(|(_, n)| n.preview.is_some_and(|p| !p.pinned))
+        .filter(|(_, n)| n.file.is_some_and(|f| !f.pinned))
         .map(|(id, _)| id)
         .collect();
     for id in ids {
@@ -872,22 +886,57 @@ fn close_unpinned_previews(arena: &mut NodeArena) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_preview_node(
+/// Default file-node box (info panel; no image yet): fixed size, resized to the
+/// image aspect later if a preview decodes.
+const FILE_NODE_W: f32 = 260.0;
+const FILE_NODE_H: f32 = model::HEADER_H + 82.0;
+
+/// Synchronously create a file node for `path` (metadata only, no image yet),
+/// attach it as the open child of item `idx` in `node`, place it beside the row
+/// and collision-resolve it. Returns the new node id, or None if the stat fails.
+fn open_file_node(
     arena: &mut NodeArena,
     ui: &mut Ui,
     node: NodeId,
-    item: usize,
+    idx: usize,
     path: PathBuf,
+    pinned: bool,
+    window: Point,
+) -> Option<NodeId> {
+    let meta = model::FileMeta::read(&path)?;
+    let origin = {
+        let p = arena.get(node)?;
+        let item_y = p.items.get(idx).map(|it| it.rect.min.y).unwrap_or(0.0);
+        Point::new(p.rect.max.x + 20.0, p.rect.min.y + item_y - p.scroll)
+    };
+    let rect = geom::Rect::from_xywh(origin.x, origin.y, FILE_NODE_W, FILE_NODE_H);
+    let child_id = arena.insert(model::file_node(path, (node, idx), meta, None, rect, pinned));
+    if let Some(n) = arena.get_mut(node) {
+        n.items[idx].child = Some(child_id);
+    }
+    let obstacles: Vec<geom::Rect> =
+        arena.iter().filter(|(id, _)| *id != child_id).map(|(_, n)| n.rect).collect();
+    let target = model::resolve_collision(rect, &obstacles, false);
+    if let Some(c) = arena.get_mut(child_id) {
+        if target != rect {
+            c.anim_to = Some(target.min);
+        }
+    }
+    ui.ensure_visible(target, window);
+    Some(child_id)
+}
+
+/// Attach a decoded image to an existing file node, growing the box to the
+/// image aspect (capped to the safe area) and re-resolving collisions.
+fn attach_image(
+    arena: &mut NodeArena,
+    ui: &mut Ui,
+    id: NodeId,
     tex: u32,
     img_w: u32,
     img_h: u32,
-    pinned: bool,
     window: Point,
 ) {
-    let Some(p) = arena.get(node) else { return };
-    let item_y = p.items.get(item).map(|it| it.rect.min.y).unwrap_or(0.0);
-    let origin = Point::new(p.rect.max.x + 20.0, p.rect.min.y + item_y - p.scroll);
     let cap = ui::node_max_size(window);
     let aspect = (img_w.max(1) as f32) / (img_h.max(1) as f32);
     // Box = header bar + aspect-locked image; cap the whole box to the area.
@@ -897,19 +946,20 @@ fn spawn_preview_node(
         box_h = cap.y;
         w = ((box_h - model::HEADER_H).max(1.0) * aspect).min(cap.x);
     }
-    let rect = geom::Rect::from_xywh(origin.x, origin.y, w, box_h);
-    let child_id =
-        arena.insert(model::preview_node(path, (node, item), tex, img_w, img_h, rect, pinned));
-    if let Some(n) = arena.get_mut(node) {
-        n.items[item].child = Some(child_id);
+    let Some(n) = arena.get_mut(id) else { return };
+    n.rect.max = Point::new(n.rect.min.x + w, n.rect.min.y + box_h);
+    n.content_w = w;
+    n.content_h = box_h;
+    if let Some(f) = &mut n.file {
+        f.image = Some(model::ImageTex { tex, img_w, img_h });
     }
-    // Collision-resolve down/right, like a freshly opened directory.
+    let rect = n.rect;
     let obstacles: Vec<geom::Rect> =
-        arena.iter().filter(|(id, _)| *id != child_id).map(|(_, n)| n.rect).collect();
+        arena.iter().filter(|(x, _)| *x != id).map(|(_, n)| n.rect).collect();
     let target = model::resolve_collision(rect, &obstacles, false);
     if target != rect {
-        if let Some(c) = arena.get_mut(child_id) {
-            c.anim_to = Some(target.min);
+        if let Some(n) = arena.get_mut(id) {
+            n.anim_to = Some(target.min);
         }
     }
     ui.ensure_visible(target, window);
@@ -963,6 +1013,9 @@ fn apply_task_result(
                         // place is outside the visible area.
                         ui.ensure_visible(target, window);
                     }
+                    // Single-click-to-open triggered this scan; the freshly
+                    // opened directory becomes the active node.
+                    ui.set_active(arena, Some(child_id));
                 }
                 Err(e) => {
                     // C returned NULL silently; at least log it.

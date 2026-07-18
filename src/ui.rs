@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::geom::{Point, Rect};
 use crate::gfx::renderer2d::{DrawList, Rgba, TexSlot};
-use crate::model::{NodeArena, NodeId, HEADER_H, ROW_ICON, ROW_ICON_GAP};
+use crate::model::{FileMeta, NodeArena, NodeId, HEADER_H, ROW_ICON, ROW_ICON_GAP};
 use crate::platform::wayland::PointerState;
 use crate::text::{Icon, TextSystem};
 use crate::textfield::TextField;
@@ -36,13 +36,14 @@ pub enum Action {
     CopyPath,
     OpenTerminal,
     Row { node: NodeId, item: usize },
-    NodeBody,
+    /// Click on a node's body/header: make it the active node.
+    NodeBody { node: NodeId },
     CloseNode { node: NodeId },
     /// Toggle the node's path in the favorites set (header star button).
     ToggleFavorite { node: NodeId },
-    /// Pin a transient preview node so it stays open (header pin button).
+    /// Pin a transient file node so it stays open (header pin button).
     PinPreview { node: NodeId },
-    /// Press target for a preview node's corner resize handle.
+    /// Press target for a file node's corner resize handle.
     ResizePreview { node: NodeId },
 }
 
@@ -110,10 +111,14 @@ pub struct Ui {
     /// screen position; the camera is derived from these each zoom step.
     zoom_pivot_world: Point,
     zoom_pivot_screen: Point,
-    pub selection: Option<(NodeId, usize)>,
+    /// The node the URL bar and amber route reflect: whatever you last opened
+    /// or clicked. Replaces the old (node, row) selection — a file or directory
+    /// is now always a whole node.
+    pub active_node: Option<NodeId>,
     /// Nodes in the current marquee multi-selection. Dragging any one of them
     /// moves the whole set; a click on empty canvas clears it.
     pub selected_nodes: HashSet<NodeId>,
+    /// Path of the active node, cached for the URL bar / clipboard / terminal.
     pub selected_path: Option<PathBuf>,
     /// Paths the user has starred (in-memory for now; #10 adds persistence).
     pub favorites: HashSet<PathBuf>,
@@ -180,7 +185,7 @@ impl Ui {
             zoom_target: 1.0,
             zoom_pivot_world: Point::ZERO,
             zoom_pivot_screen: Point::ZERO,
-            selection: None,
+            active_node: None,
             selected_nodes: HashSet::new(),
             selected_path: None,
             favorites: HashSet::new(),
@@ -238,6 +243,13 @@ impl Ui {
             self.camera_target = base.add(Point::new(dx, dy));
             self.refocus = true;
         }
+    }
+
+    /// Make `node` the active node (what the URL bar and amber route reflect),
+    /// caching its path. `None` clears the active node.
+    pub fn set_active(&mut self, arena: &NodeArena, node: Option<NodeId>) {
+        self.active_node = node;
+        self.selected_path = node.and_then(|id| arena.get(id)).map(|n| n.path.clone());
     }
 
     /// Apply a pinch zoom `factor` immediately (the gesture is continuous, so
@@ -446,8 +458,8 @@ impl Ui {
                     // Aspect-locked resize from the corner: width follows the
                     // world-space cursor, height keeps the image's aspect.
                     if let Some(node) = arena.get_mut(id) {
-                        if let Some(pv) = node.preview {
-                            let aspect = (pv.img_w.max(1) as f32) / (pv.img_h.max(1) as f32);
+                        if let Some(img) = node.file.and_then(|f| f.image) {
+                            let aspect = (img.img_w.max(1) as f32) / (img.img_h.max(1) as f32);
                             let world_x = cursor.x / self.zoom + self.camera.x;
                             let new_w = (world_x - node.rect.min.x).max(PREVIEW_MIN_W);
                             // Box = header bar + aspect-locked image below it.
@@ -541,9 +553,6 @@ impl Ui {
 
 /// Colors from draw.c.
 const COLOR_BOX_FILL: Rgba = Rgba([0, 0, 0, 128]); // rgba(0,0,0,0.5)
-/// The selected row is highlighted with the app's amber accent (the same
-/// colour as the active route), instead of colouring the label text.
-const COLOR_ROW_SELECTED_BG: Rgba = Rgba([255, 191, 64, 66]); // amber ~0.26
 const HOVER_ROW_BG: Rgba = Rgba([255, 255, 255, 26]); // white 0.10
 const HOVER_BUTTON_BG: Rgba = Rgba([255, 255, 255, 38]); // white 0.15
 /// Zebra striping on alternate rows — fainter than the hover highlight so it
@@ -630,7 +639,7 @@ pub fn build_frame(
     let view = View { cam: ui.camera, zoom: ui.zoom, window };
     // The 90% box cap is in world units (zoom-independent), based on window.
     let cap = node_max_size(window);
-    let path = path_nodes(arena, ui.selection);
+    let path = path_nodes(arena, ui.active_node);
     // The current canvas root's path is the URL bar's default when nothing is
     // selected (there is always a node open).
     let root_path = arena.get(root).map(|n| n.path.clone());
@@ -653,18 +662,12 @@ pub fn build_frame(
     out
 }
 
-/// The set of nodes forming the route shown in the URL bar: the node holding
-/// the selection, all of its ancestors, and the opened child of the selected
-/// item (whose path equals the URL when the selection is an open directory).
-fn path_nodes(arena: &NodeArena, selection: Option<(NodeId, usize)>) -> HashSet<NodeId> {
+/// The route highlighted amber (borders + connector wires): the active node
+/// and every ancestor up to the root. The URL bar shows the active node's path,
+/// so the route is exactly the chain that path names.
+fn path_nodes(arena: &NodeArena, active: Option<NodeId>) -> HashSet<NodeId> {
     let mut set = HashSet::new();
-    let Some((node, item)) = selection else { return set };
-    if let Some(n) = arena.get(node) {
-        if let Some(child) = n.items.get(item).and_then(|it| it.child) {
-            set.insert(child);
-        }
-    }
-    let mut cur = Some(node);
+    let mut cur = active;
     while let Some(id) = cur {
         set.insert(id);
         cur = arena.get(id).and_then(|n| n.parent.map(|(p, _)| p));
@@ -789,8 +792,8 @@ fn draw_connectors(
 ) {
     let (node_rect, scroll) = {
         let Some(node) = arena.get_mut(id) else { return };
-        // Preview boxes are user-sized; only directory boxes get re-clamped.
-        if node.preview.is_none() {
+        // File nodes are user-sized; only directory boxes get re-clamped.
+        if node.file.is_none() {
             let box_w = node.content_w.min(cap.x);
             let box_h = node.content_h.min(cap.y);
             node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
@@ -830,6 +833,63 @@ fn draw_connectors(
     }
 }
 
+/// Draw a file node's metadata panel (name, size, permissions) inside `body`
+/// (world coords). Phase 2 will add owner/group and modified/created dates.
+fn draw_file_info(
+    ts: &mut TextSystem,
+    list: &mut DrawList,
+    view: View,
+    body: Rect,
+    name: &str,
+    meta: &FileMeta,
+) {
+    const PAD: f32 = 6.0;
+    let z = view.zoom;
+    let lh = ts.line_height();
+    let clip = view.w2s_rect(body);
+    let x = body.min.x + PAD;
+    let dim = Rgba::new(1.0, 1.0, 1.0, 0.7);
+    let lines = [
+        (name.to_string(), Rgba::WHITE),
+        (fmt_size(meta.size), dim),
+        (fmt_mode(meta.mode), dim),
+    ];
+    let mut y = body.min.y + PAD;
+    for (s, color) in &lines {
+        ts.draw_clipped(list, view.w2s(Point::new(x, y)), s, *color, clip, z);
+        y += lh;
+    }
+}
+
+/// Human-readable byte size, e.g. `1.2 MiB` (exact `B` under 1 KiB).
+fn fmt_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// Unix permission bits as an `rwxr-xr-x` string.
+fn fmt_mode(mode: u32) -> String {
+    let tri = |b: u32| {
+        format!(
+            "{}{}{}",
+            if b & 0b100 != 0 { "r" } else { "-" },
+            if b & 0b010 != 0 { "w" } else { "-" },
+            if b & 0b001 != 0 { "x" } else { "-" },
+        )
+    };
+    format!("{}{}{}", tri((mode >> 6) & 7), tri((mode >> 3) & 7), tri(mode & 7))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_entries(
     ui: &mut Ui,
@@ -847,58 +907,69 @@ fn draw_entries(
     let z = view.zoom;
 
     // Re-clamp the box and scroll every frame so window resizes keep the
-    // 90% rule without a relayout. Preview boxes are user-sized and skip this.
-    let (node_rect, scroll, content_h, is_root, preview_info, favorited) = {
+    // 90% rule without a relayout. File nodes are user-sized and skip this.
+    let (node_rect, scroll, content_h, is_root, file_view, favorited, fname) = {
         let Some(node) = arena.get_mut(id) else { return };
-        let preview_info = node.preview.map(|p| (p.tex, p.pinned));
-        if preview_info.is_none() {
+        let file_view = node.file;
+        if file_view.is_none() {
             let box_w = node.content_w.min(cap.x);
             let box_h = node.content_h.min(cap.y);
             node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
             node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
         }
         let favorited = ui.favorites.contains(&node.path);
-        (node.rect, node.scroll, node.content_h, node.parent.is_none(), preview_info, favorited)
+        let fname =
+            node.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        (node.rect, node.scroll, node.content_h, node.parent.is_none(), file_view, favorited, fname)
     };
 
-    // Preview node: header bar, the image below it, and a corner resize
-    // handle, then stop — no rows, no scroll, no children.
-    if let Some((tex, pinned)) = preview_info {
+    // File node: header, then either the decoded image or a metadata panel,
+    // plus a corner resize handle for images. No rows, scroll, or children.
+    if let Some(fv) = file_view {
         if visible.intersects(node_rect) {
             let screen = view.w2s_rect(node_rect);
             list.rect(screen, COLOR_BOX_FILL, 5.0);
-            // Image fills the content region below the header.
-            let img_world = Rect {
+            let body = Rect {
                 min: Point::new(node_rect.min.x + 2.0, node_rect.min.y + HEADER_H),
                 max: Point::new(node_rect.max.x - 2.0, node_rect.max.y - 2.0),
             };
-            list.image_tex(view.w2s_rect(img_world), tex);
+            match fv.image {
+                Some(img) => list.image_tex(view.w2s_rect(body), img.tex),
+                None => draw_file_info(ts, list, view, body, &fname, &fv.meta),
+            }
             let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
             list.rect_stroke(screen, border, 5.0, 3.0);
             if ui.selected_nodes.contains(&id) {
                 draw_dashed_rect(list, inflate(screen, 4.0), COLOR_MULTISELECT, 2.0);
             }
-            ui.hitboxes.push(Hitbox { area: screen, action: Action::NodeBody, drag: DragKind::Node(id) });
-            // Unpinned previews show a pin button (they are transient); pinned
-            // ones show a close button.
-            let primary = if pinned {
+            ui.hitboxes.push(Hitbox {
+                area: screen,
+                action: Action::NodeBody { node: id },
+                drag: DragKind::Node(id),
+            });
+            // Unpinned file nodes show a pin button (transient); pinned ones a
+            // close button.
+            let primary = if fv.pinned {
                 (Icon::Close, Action::CloseNode { node: id })
             } else {
                 (Icon::Pin, Action::PinPreview { node: id })
             };
             draw_header(ui, ts, list, view, id, node_rect, Icon::File, Some(primary), favorited);
-            // Corner resize handle (bottom-right): two short edge lines.
-            let hr = view.w2s_rect(Rect::from_xywh(
-                node_rect.max.x - PREVIEW_HANDLE,
-                node_rect.max.y - PREVIEW_HANDLE,
-                PREVIEW_HANDLE,
-                PREVIEW_HANDLE,
-            ));
-            let raction = Action::ResizePreview { node: id };
-            let hc = if ui.hover == Some(raction) { Rgba::WHITE } else { Rgba::new(1.0, 1.0, 1.0, 0.6) };
-            list.line(Point::new(hr.min.x, hr.max.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
-            list.line(Point::new(hr.max.x, hr.min.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
-            ui.hitboxes.push(Hitbox { area: hr, action: raction, drag: DragKind::Resize(id) });
+            // Aspect-locked corner resize handle, images only.
+            if fv.image.is_some() {
+                let hr = view.w2s_rect(Rect::from_xywh(
+                    node_rect.max.x - PREVIEW_HANDLE,
+                    node_rect.max.y - PREVIEW_HANDLE,
+                    PREVIEW_HANDLE,
+                    PREVIEW_HANDLE,
+                ));
+                let raction = Action::ResizePreview { node: id };
+                let hc =
+                    if ui.hover == Some(raction) { Rgba::WHITE } else { Rgba::new(1.0, 1.0, 1.0, 0.6) };
+                list.line(Point::new(hr.min.x, hr.max.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
+                list.line(Point::new(hr.max.x, hr.min.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
+                ui.hitboxes.push(Hitbox { area: hr, action: raction, drag: DragKind::Resize(id) });
+            }
         }
         return;
     }
@@ -911,7 +982,7 @@ fn draw_entries(
         if ui.selected_nodes.contains(&id) {
             draw_dashed_rect(list, inflate(screen_rect, 4.0), COLOR_MULTISELECT, 2.0);
         }
-        ui.hitboxes.push(Hitbox { area: screen_rect, action: Action::NodeBody, drag: DragKind::Node(id) });
+        ui.hitboxes.push(Hitbox { area: screen_rect, action: Action::NodeBody { node: id }, drag: DragKind::Node(id) });
         let primary = (!is_root).then_some((Icon::Close, Action::CloseNode { node: id }));
         draw_header(ui, ts, list, view, id, node_rect, Icon::Folder, primary, favorited);
     }
@@ -937,7 +1008,6 @@ fn draw_entries(
         };
         let row_in_box = rect.max.y > content_clip.min.y && rect.min.y < content_clip.max.y;
         let in_view = visible.intersects(band) && row_in_box;
-        let selected = ui.selection == Some((id, i));
         let child = item.child;
         let is_dir = item.is_dir;
         let scanning = item.scanning;
@@ -948,16 +1018,12 @@ fn draw_entries(
 
         if in_view {
             let row_action = Action::Row { node: id, item: i };
-            // Row backgrounds, painted bottom-up: zebra, then the persistent
-            // selection highlight, then the hover feedback.
+            // Row backgrounds, painted bottom-up: zebra, then hover feedback.
+            // There is no persistent per-row selection anymore — "where you are"
+            // is shown by the active node's amber route, not a highlighted row.
             if i % 2 == 1 {
                 if let Some(bg) = band.intersect(content_clip) {
                     list.rect(view.w2s_rect(bg), ALT_ROW_BG, 0.0);
-                }
-            }
-            if selected {
-                if let Some(bg) = band.intersect(content_clip) {
-                    list.rect(view.w2s_rect(bg), COLOR_ROW_SELECTED_BG, 3.0);
                 }
             }
             if ui.hover == Some(row_action) {
@@ -965,8 +1031,6 @@ fn draw_entries(
                     list.rect(view.w2s_rect(bg), HOVER_ROW_BG, 3.0);
                 }
             }
-            // Labels are always white now; state is shown by the row highlight
-            // (selection) and the connector wire (open).
             let color = Rgba::WHITE;
             // File-type icon (#14): folder for directories, page for files.
             // Only drawn when the row sits fully inside the box so it never

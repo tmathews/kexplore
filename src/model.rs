@@ -34,22 +34,64 @@ pub struct Node {
     /// When set, the box glides its min corner toward this point (collision
     /// resolve after an open or a drag-release); cleared on arrival.
     pub anim_to: Option<Point>,
-    /// Some for image-preview nodes: they draw a texture instead of rows and
-    /// resize by the corner handle. Directory nodes leave this None.
-    pub preview: Option<PreviewData>,
+    /// Some for file nodes: they represent a single file (metadata panel, plus
+    /// an image when the type can be displayed) instead of directory rows.
+    /// Directory nodes leave this None.
+    pub file: Option<FileView>,
 }
 
-/// State for an image-preview node.
+/// A file node's contents: its stat metadata, an optional decoded image, and
+/// whether it has been pinned open (unpinned file nodes are transient).
 #[derive(Clone, Copy)]
-pub struct PreviewData {
+pub struct FileView {
+    pub meta: FileMeta,
+    /// Present once an image preview has been decoded for a displayable type.
+    pub image: Option<ImageTex>,
+    /// Unpinned file nodes are transient (opened on click, closed when the
+    /// active file moves); pinning keeps the node open like a directory node.
+    pub pinned: bool,
+}
+
+/// A decoded image bound to a file node.
+#[derive(Clone, Copy)]
+pub struct ImageTex {
     /// Opaque texture id, indexing the descriptor table owned by main.rs.
     pub tex: u32,
     /// Intrinsic image size in pixels (for aspect-locked resize).
     pub img_w: u32,
     pub img_h: u32,
-    /// Unpinned previews are transient (auto-opened on select, closed when the
-    /// selection moves); pinning keeps the node open like a directory node.
-    pub pinned: bool,
+}
+
+/// File stat metadata shown in a file node's info panel. All fields are Copy so
+/// `FileView` stays Copy; uid/gid resolve to names lazily at draw time.
+// uid/gid/mtime/ctime are captured now but only rendered in Phase 2 (owner,
+// group, and the modified/created dates).
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct FileMeta {
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// Modification / change time as seconds since the Unix epoch.
+    pub mtime: i64,
+    pub ctime: i64,
+}
+
+impl FileMeta {
+    /// Read metadata for `path` (following symlinks). None if the stat fails.
+    pub fn read(path: &Path) -> Option<FileMeta> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        Some(FileMeta {
+            size: m.size(),
+            mode: m.mode(),
+            uid: m.uid(),
+            gid: m.gid(),
+            mtime: m.mtime(),
+            ctime: m.ctime(),
+        })
+    }
 }
 
 pub struct Item {
@@ -196,20 +238,17 @@ pub fn node_from_items(path: PathBuf, data: Vec<ItemData>) -> Node {
         content_h: 0.0,
         scroll: 0.0,
         anim_to: None,
-        preview: None,
+        file: None,
     }
 }
 
-/// Build an image-preview node (no rows) sized to `rect`. Attached to a file
-/// item via `parent`; draws texture `tex` and resizes aspect-locked from the
-/// intrinsic `img_w`/`img_h`.
-#[allow(clippy::too_many_arguments)]
-pub fn preview_node(
+/// Build a file node (no rows) sized to `rect`, attached to a file item via
+/// `parent`. Holds the file's metadata and an optional decoded image.
+pub fn file_node(
     path: PathBuf,
     parent: (NodeId, usize),
-    tex: u32,
-    img_w: u32,
-    img_h: u32,
+    meta: FileMeta,
+    image: Option<ImageTex>,
     rect: Rect,
     pinned: bool,
 ) -> Node {
@@ -222,7 +261,7 @@ pub fn preview_node(
         content_h: rect.height(),
         scroll: 0.0,
         anim_to: None,
-        preview: Some(PreviewData { tex, img_w, img_h, pinned }),
+        file: Some(FileView { meta, image, pinned }),
     }
 }
 
