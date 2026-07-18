@@ -12,7 +12,7 @@ mod ui;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -140,23 +140,26 @@ fn main() {
     let mut scene_set = renderer.register_texture(&gfx.device, &gfx.blur.scene).expect("scene set");
     let mut blur_set = renderer.register_texture(&gfx.device, &gfx.blur.blur_b).expect("blur set");
 
-    // Root node: the user's home directory, like the C app.
+    // The canvas always roots at the filesystem root; the app opens by
+    // navigating from there down to the user's home directory.
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
     let file_handlers = handlers::read_handlers(&home.join(".config/kallos/handlers"));
     let mut children: Vec<std::process::Child> = Vec::new();
     let mut arena = NodeArena::new();
-    let root_items = model::scan_dir(&home).unwrap_or_else(|e| {
-        eprintln!("failed to load node: {e}");
+    let root_items = model::scan_dir(Path::new("/")).unwrap_or_else(|e| {
+        eprintln!("failed to load root: {e}");
         std::process::exit(1);
     });
-    let mut root = arena.insert(model::node_from_items(home, root_items));
-    model::calc_size(&mut arena, root, &mut ts, ui::node_max_size(Point::new(600.0, 440.0)));
+    let root = arena.insert(model::node_from_items(PathBuf::from("/"), root_items));
+    let (lw, lh) = platform.logical_size;
+    let window0 = Point::new((lw.max(1)) as f32, (lh.max(1)) as f32);
+    model::calc_size(&mut arena, root, &mut ts, ui::node_max_size(window0));
 
     let mut ui = Ui::new();
-    if let Some(node) = arena.get(root) {
-        let r = node.rect;
-        ui.focus_to_rect(r, Point::new(600.0, 440.0));
-    }
+    // Open the chain of nodes down to home and focus it; snap (no startup pan).
+    navigate_to(&mut arena, &mut ui, &mut ts, root, &home, window0);
+    ui.camera = ui.camera_target;
+    ui.refocus = false;
 
     let tasks = Tasks::new().unwrap_or_else(|e| {
         eprintln!("failed to init task system: {e}");
@@ -323,11 +326,11 @@ fn main() {
                     }
                     UrlOutcome::Commit(text) => {
                         let path = PathBuf::from(expand_home(&text));
-                        if path.is_dir()
-                            && reroot(&mut arena, &mut ui, &mut ts, &mut root, path, window)
+                        // Navigate: open the chain of nodes from root to the
+                        // path (reusing open ones) and jump the camera there.
+                        if path.exists()
+                            && navigate_to(&mut arena, &mut ui, &mut ts, root, &path, window)
                         {
-                            // reroot closes the old tree (preview nodes with
-                            // it); their textures retire next frame.
                             ui.url.cancel();
                         }
                         // Invalid path: stay in the editor so it can be fixed.
@@ -562,34 +565,108 @@ fn expand_home(text: &str) -> String {
     text.to_string()
 }
 
-/// Re-root the whole canvas at `path` (URL bar commit): the old tree is
-/// closed and a fresh root scanned synchronously.
-fn reroot(
+/// Open every directory node from the root (`/`) down to `target`, reusing
+/// nodes that are already open, select the target, and jump the camera to it.
+/// Preserves all other open nodes. Returns false if the target isn't reachable
+/// (a path component is missing).
+fn navigate_to(
     arena: &mut NodeArena,
     ui: &mut Ui,
     ts: &mut TextSystem,
-    root: &mut NodeId,
-    path: PathBuf,
+    root: NodeId,
+    target: &Path,
     window: Point,
 ) -> bool {
-    match model::scan_dir(&path) {
-        Ok(data) => {
-            arena.close_recursive(*root);
-            *root = arena.insert(model::node_from_items(path.clone(), data));
-            model::calc_size(arena, *root, ts, ui::node_max_size(window));
-            ui.selection = None;
-            ui.selected_path = Some(path);
-            if let Some(n) = arena.get(*root) {
+    let Some(root_path) = arena.get(root).map(|n| n.path.clone()) else { return false };
+    let Ok(rel) = target.strip_prefix(&root_path) else { return false };
+    let comps: Vec<&OsStr> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+
+    // Target is the root itself: just focus it.
+    if comps.is_empty() {
+        if let Some(n) = arena.get(root) {
+            let r = n.rect;
+            ui.focus_to_rect(r, window);
+        }
+        ui.selection = None;
+        ui.selected_path = Some(root_path);
+        return true;
+    }
+
+    let mut current = root;
+    let mut cur_path = root_path;
+    let last = comps.len() - 1;
+    for (i, &comp) in comps.iter().enumerate() {
+        let Some(node) = arena.get(current) else { return false };
+        let Some(idx) = node.items.iter().position(|it| it.name.as_os_str() == comp) else {
+            return false; // path component not present (renamed / removed)
+        };
+        let is_dir = node.items[idx].is_dir;
+        cur_path = cur_path.join(comp);
+        ui.selection = Some((current, idx));
+        ui.selected_path = Some(cur_path.clone());
+
+        if is_dir {
+            // Reuse the already-open child, or open it synchronously.
+            let child = match arena.get(current).and_then(|n| n.items[idx].child) {
+                Some(c) => c,
+                None => match open_child_sync(arena, ts, current, idx, cur_path.clone(), window) {
+                    Some(c) => c,
+                    None => return false,
+                },
+            };
+            if i == last {
+                // Target directory: focus its node.
+                if let Some(n) = arena.get(child) {
+                    let r = n.rect;
+                    ui.focus_to_rect(r, window);
+                }
+            } else {
+                current = child;
+            }
+        } else {
+            // Target file (must be the last component): focus its parent node.
+            if let Some(n) = arena.get(current) {
                 let r = n.rect;
                 ui.focus_to_rect(r, window);
             }
-            true
-        }
-        Err(e) => {
-            eprintln!("cannot open {}: {e}", path.display());
-            false
+            break;
         }
     }
+    true
+}
+
+/// Synchronously scan `path` and attach it as the open child of item `idx` in
+/// `node`; returns the new node id, collision-resolved into a free spot.
+fn open_child_sync(
+    arena: &mut NodeArena,
+    ts: &mut TextSystem,
+    node: NodeId,
+    idx: usize,
+    path: PathBuf,
+    window: Point,
+) -> Option<NodeId> {
+    let data = model::scan_dir(&path).ok()?;
+    let mut child = model::node_from_items(path, data);
+    child.parent = Some((node, idx));
+    let child_id = arena.insert(child);
+    if let Some(n) = arena.get_mut(node) {
+        n.items[idx].child = Some(child_id);
+    }
+    model::calc_size(arena, child_id, ts, ui::node_max_size(window));
+    let cand = arena.get(child_id).map(|n| n.rect)?;
+    let obstacles: Vec<geom::Rect> =
+        arena.iter().filter(|(id, _)| *id != child_id).map(|(_, n)| n.rect).collect();
+    let target = model::resolve_collision(cand, &obstacles, false);
+    if let Some(n) = arena.get_mut(child_id) {
+        n.rect = target;
+    }
+    Some(child_id)
 }
 
 /// Clipboard via wl-copy/wl-paste (same tools the toolbar copy button
