@@ -36,7 +36,6 @@ pub enum Action {
     CopyPath,
     OpenTerminal,
     Row { node: NodeId, item: usize },
-    OpenWith { node: NodeId, item: usize },
     NodeBody,
     CloseNode { node: NodeId },
     /// Toggle the node's path in the favorites set (header star button).
@@ -812,15 +811,6 @@ fn draw_entries(
                     action: row_action,
                     drag: DragKind::Node(id),
                 });
-            }
-            if selected && !is_dir {
-                let r = view.w2s_rect(Rect::from_xywh(side_x + 10.0, rect.min.y + 4.0, 20.0, 20.0));
-                let action = Action::OpenWith { node: id, item: i };
-                if ui.hover == Some(action) {
-                    list.rect(inflate(r, 3.0), HOVER_BUTTON_BG, 5.0);
-                }
-                list.glyph_quad(r, ts.icon_uv(Icon::Open), Rgba::WHITE, 0.0);
-                ui.hitboxes.push(Hitbox { area: r, action, drag: DragKind::Node(id) });
             }
         }
 

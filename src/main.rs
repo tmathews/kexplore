@@ -878,19 +878,6 @@ fn handle_action(
                 }
             }
         }
-        Action::OpenWith { node, item } => {
-            let Some(n) = arena.get(node) else { return };
-            let Some(it) = n.items.get(item) else { return };
-            let path = n.path.join(&it.name);
-            match handlers::find_handler(file_handlers, &path) {
-                Some(h) => {
-                    if let Err(e) = handlers::spawn_handler(h, &path, children) {
-                        eprintln!("handler failed for {}: {e}", path.display());
-                    }
-                }
-                None => eprintln!("no handler for {}", path.display()),
-            }
-        }
         // UrlBar, FocusHome and GoUp are handled inline in the main loop (they
         // need text/caret state or navigate_to); ResizePreview is press-driven.
         Action::NodeBody
