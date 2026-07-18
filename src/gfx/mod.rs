@@ -385,8 +385,10 @@ impl Gfx {
                 .image_memory_barriers(std::slice::from_ref(&scene_to_attachment)),
         );
         // Premultiplied clear: rgb is already multiplied by a (rgb = 0).
+        // Mostly opaque so the background grid reads clearly, but keeps a hint
+        // of window translucency.
         let clear = vk::ClearValue {
-            color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.8] },
+            color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.94] },
         };
         let scene_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(self.blur.scene.view)
