@@ -39,22 +39,46 @@ pub enum Action {
     OpenWith { node: NodeId, item: usize },
     NodeBody,
     CloseNode { node: NodeId },
+    /// Press target for a preview node's corner resize handle.
+    ResizePreview { node: NodeId },
+}
+
+/// What a press-drag on a hitbox does once it crosses the move threshold.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DragKind {
+    /// Pan the camera.
+    None,
+    /// Move this node.
+    Node(NodeId),
+    /// Aspect-locked resize of this preview node from its corner.
+    Resize(NodeId),
+}
+
+impl DragKind {
+    /// The node this drag concerns, if any (used for wheel-scroll targeting).
+    fn node(self) -> Option<NodeId> {
+        match self {
+            DragKind::Node(id) | DragKind::Resize(id) => Some(id),
+            DragKind::None => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 pub struct Hitbox {
     pub area: Rect, // screen space (logical px)
     pub action: Action,
-    /// Node to move when a drag starts on this box; None pans the camera.
-    pub drag: Option<NodeId>,
+    /// What a drag starting on this box does.
+    pub drag: DragKind,
 }
 
 pub enum DragState {
     None,
     /// Button is down but movement hasn't crossed the threshold yet.
-    Pending { origin: Point, node: Option<NodeId> },
+    Pending { origin: Point, kind: DragKind },
     Camera,
     Node(NodeId),
+    Resize(NodeId),
 }
 
 pub struct Ui {
@@ -191,7 +215,7 @@ impl Ui {
         // Mouse wheel over a node scrolls its content.
         let wheel = pointer.scroll_delta as f32;
         if wheel != 0.0 {
-            if let Some(id) = hit.and_then(|h| h.drag) {
+            if let Some(id) = hit.and_then(|h| h.drag.node()) {
                 if let Some(node) = arena.get_mut(id) {
                     let max_scroll = (node.content_h - node.rect.height()).max(0.0);
                     if max_scroll > 0.0 {
@@ -203,16 +227,18 @@ impl Ui {
         }
 
         if pointer.pressed {
-            self.drag = DragState::Pending { origin: cursor, node: hit.and_then(|h| h.drag) };
+            let kind = hit.map(|h| h.drag).unwrap_or(DragKind::None);
+            self.drag = DragState::Pending { origin: cursor, kind };
         }
 
         if pointer.is_down {
             let delta = cursor.sub(self.last_pointer);
-            if let DragState::Pending { origin, node } = self.drag {
+            if let DragState::Pending { origin, kind } = self.drag {
                 if cursor.sub(origin).length() >= 1.0 {
-                    self.drag = match node {
-                        Some(id) => DragState::Node(id),
-                        None => DragState::Camera,
+                    self.drag = match kind {
+                        DragKind::Node(id) => DragState::Node(id),
+                        DragKind::Resize(id) => DragState::Resize(id),
+                        DragKind::None => DragState::Camera,
                     };
                 }
             }
@@ -228,6 +254,24 @@ impl Ui {
                         node.anim_to = None;
                         node.rect = node.rect.offset(delta);
                         dirty = true;
+                    }
+                }
+                DragState::Resize(id) => {
+                    // Aspect-locked resize from the corner: width follows the
+                    // world-space cursor, height keeps the image's aspect.
+                    if let Some(node) = arena.get_mut(id) {
+                        if let Some(pv) = node.preview {
+                            let aspect = (pv.img_w.max(1) as f32) / (pv.img_h.max(1) as f32);
+                            let world_x = cursor.x + self.camera.x;
+                            let new_w = (world_x - node.rect.min.x).max(PREVIEW_MIN_W);
+                            let new_h = new_w / aspect;
+                            node.anim_to = None;
+                            node.rect.max =
+                                Point::new(node.rect.min.x + new_w, node.rect.min.y + new_h);
+                            node.content_w = new_w;
+                            node.content_h = new_h;
+                            dirty = true;
+                        }
                     }
                 }
                 _ => {}
@@ -254,9 +298,9 @@ impl Ui {
                     self.last_click = None;
                 }
             }
-            if let DragState::Node(id) = self.drag {
-                // Snap-on-release: if the dropped node overlaps others, glide
-                // it to the nearest free spot (search all four directions).
+            if let DragState::Node(id) | DragState::Resize(id) = self.drag {
+                // Snap-on-release: if the dropped/resized node overlaps others,
+                // glide it to the nearest free spot (search all four directions).
                 if let Some(cand) = arena.get(id).map(|n| n.rect) {
                     let obstacles: Vec<Rect> = arena
                         .iter()
@@ -295,6 +339,11 @@ const COLOR_PATH_BORDER: Rgba = Rgba([255, 191, 64, 255]);
 /// Two clicks on the same target within this window count as a double click.
 const DOUBLE_CLICK_MS: u128 = 400;
 
+/// Smallest width (logical px) an image-preview node can be resized to.
+const PREVIEW_MIN_W: f32 = 100.0;
+/// Size (logical px) of the corner resize handle on a preview node.
+const PREVIEW_HANDLE: f32 = 16.0;
+
 fn inflate(r: Rect, by: f32) -> Rect {
     Rect { min: Point::new(r.min.x - by, r.min.y - by), max: Point::new(r.max.x + by, r.max.y + by) }
 }
@@ -318,7 +367,6 @@ pub fn build_frame(
     overlay: &mut DrawList,
     window: Point,
     spin_angle: f32,
-    preview: Option<(u32, u32)>,
     caret_visible: bool,
 ) -> FrameOut {
     ui.hitboxes.clear();
@@ -330,7 +378,6 @@ pub fn build_frame(
     // lines pass *under* the nodes rather than across their content.
     draw_connectors(arena, root, canvas, camera, cap);
     draw_entries(ui, arena, root, ts, canvas, camera, spin_angle, &path, &mut out);
-    draw_preview(canvas, window, preview);
     draw_navigation(ui, ts, overlay, window, caret_visible);
     out
 }
@@ -367,10 +414,13 @@ fn draw_connectors(
     let off = Point::new(-camera.min.x, -camera.min.y);
     let (node_rect, scroll) = {
         let Some(node) = arena.get_mut(id) else { return };
-        let box_w = node.content_w.min(cap.x);
-        let box_h = node.content_h.min(cap.y);
-        node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
-        node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
+        // Preview boxes are user-sized; only directory boxes get re-clamped.
+        if node.preview.is_none() {
+            let box_w = node.content_w.min(cap.x);
+            let box_h = node.content_h.min(cap.y);
+            node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
+            node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
+        }
         (node.rect, node.scroll)
     };
     let item_count = arena.get(id).map(|n| n.items.len()).unwrap_or(0);
@@ -399,21 +449,6 @@ fn draw_connectors(
     }
 }
 
-/// Port of draw_preview: scaled to 400 wide (upscaling small images too,
-/// like the C app), anchored bottom-right with a 10px margin and a 1px
-/// white border, drawn under the toolbar.
-fn draw_preview(list: &mut DrawList, window: Point, preview: Option<(u32, u32)>) {
-    let Some((w, h)) = preview else { return };
-    if w == 0 {
-        return;
-    }
-    let scale = 400.0 / w as f32;
-    let (pw, ph) = (400.0, h as f32 * scale);
-    let r = Rect::from_xywh(window.x - 10.0 - pw, window.y - 10.0 - ph, pw, ph);
-    list.image(r);
-    list.rect_stroke(r, Rgba::WHITE, 0.0, 1.0);
-}
-
 #[allow(clippy::too_many_arguments)]
 fn draw_entries(
     ui: &mut Ui,
@@ -430,22 +465,69 @@ fn draw_entries(
     let cap = node_max_size(camera.size());
 
     // Re-clamp the box and scroll every frame so window resizes keep the
-    // 90% rule without a relayout.
-    let (node_rect, scroll, content_h, is_root) = {
+    // 90% rule without a relayout. Preview boxes are user-sized and skip this.
+    let (node_rect, scroll, content_h, is_root, preview_tex) = {
         let Some(node) = arena.get_mut(id) else { return };
-        let box_w = node.content_w.min(cap.x);
-        let box_h = node.content_h.min(cap.y);
-        node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
-        node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
-        (node.rect, node.scroll, node.content_h, node.parent.is_none())
+        let preview_tex = node.preview.map(|p| p.tex);
+        if preview_tex.is_none() {
+            let box_w = node.content_w.min(cap.x);
+            let box_h = node.content_h.min(cap.y);
+            node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
+            node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
+        }
+        (node.rect, node.scroll, node.content_h, node.parent.is_none(), preview_tex)
     };
+
+    // Preview node: draw the image, a close button, and a corner resize
+    // handle, then stop — no rows, no scroll, no children.
+    if let Some(tex) = preview_tex {
+        if camera.intersects(node_rect) {
+            let screen = node_rect.offset(off);
+            list.rect(screen, COLOR_BOX_FILL, 3.0); // shows through transparency
+            let img = Rect {
+                min: Point::new(screen.min.x + 2.0, screen.min.y + 2.0),
+                max: Point::new(screen.max.x - 2.0, screen.max.y - 2.0),
+            };
+            list.image_tex(img, tex);
+            let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
+            list.rect_stroke(screen, border, 3.0, 2.0);
+            ui.hitboxes.push(Hitbox {
+                area: screen,
+                action: Action::NodeBody,
+                drag: DragKind::Node(id),
+            });
+            // Close button, hanging above the top-left like directory nodes.
+            let cr = Rect::from_xywh(node_rect.min.x + 2.0, node_rect.min.y - 25.0, 20.0, 20.0)
+                .offset(off);
+            let caction = Action::CloseNode { node: id };
+            if ui.hover == Some(caction) {
+                list.rect(inflate(cr, 3.0), HOVER_BUTTON_BG, 5.0);
+            }
+            list.glyph_quad(cr, ts.icon_uv(Icon::Close), Rgba::WHITE, 0.0);
+            ui.hitboxes.push(Hitbox { area: cr, action: caction, drag: DragKind::Node(id) });
+            // Corner resize handle (bottom-right): two short edge lines.
+            let hr = Rect::from_xywh(
+                node_rect.max.x - PREVIEW_HANDLE,
+                node_rect.max.y - PREVIEW_HANDLE,
+                PREVIEW_HANDLE,
+                PREVIEW_HANDLE,
+            )
+            .offset(off);
+            let raction = Action::ResizePreview { node: id };
+            let hc = if ui.hover == Some(raction) { Rgba::WHITE } else { Rgba::new(1.0, 1.0, 1.0, 0.6) };
+            list.line(Point::new(hr.min.x, hr.max.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
+            list.line(Point::new(hr.max.x, hr.min.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
+            ui.hitboxes.push(Hitbox { area: hr, action: raction, drag: DragKind::Resize(id) });
+        }
+        return;
+    }
 
     if camera.intersects(node_rect) {
         let screen_rect = node_rect.offset(off);
         list.rect(screen_rect, COLOR_BOX_FILL, 5.0);
         let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
         list.rect_stroke(screen_rect, border, 5.0, 3.0);
-        ui.hitboxes.push(Hitbox { area: screen_rect, action: Action::NodeBody, drag: Some(id) });
+        ui.hitboxes.push(Hitbox { area: screen_rect, action: Action::NodeBody, drag: DragKind::Node(id) });
         if !is_root {
             // Close button: node.min + (2, -25), 20x20, like draw_entries.
             let r = Rect::from_xywh(node_rect.min.x + 2.0, node_rect.min.y - 25.0, 20.0, 20.0)
@@ -455,7 +537,7 @@ fn draw_entries(
                 list.rect(inflate(r, 3.0), HOVER_BUTTON_BG, 5.0);
             }
             list.glyph_quad(r, ts.icon_uv(Icon::Close), Rgba::WHITE, 0.0);
-            ui.hitboxes.push(Hitbox { area: r, action, drag: Some(id) });
+            ui.hitboxes.push(Hitbox { area: r, action, drag: DragKind::Node(id) });
         }
     }
 
@@ -521,7 +603,7 @@ fn draw_entries(
             let text_origin = Point::new(screen_rect.min.x + ROW_ICON + ROW_ICON_GAP, screen_rect.min.y);
             ts.draw_clipped(list, text_origin, &display, color, content_clip.offset(off));
             if let Some(hb) = band.offset(off).intersect(content_clip.offset(off)) {
-                ui.hitboxes.push(Hitbox { area: hb, action: row_action, drag: Some(id) });
+                ui.hitboxes.push(Hitbox { area: hb, action: row_action, drag: DragKind::Node(id) });
             }
             if selected && !is_dir {
                 let r = Rect::from_xywh(side_x + 10.0, screen_rect.min.y + 4.0, 20.0, 20.0);
@@ -530,7 +612,7 @@ fn draw_entries(
                     list.rect(inflate(r, 3.0), HOVER_BUTTON_BG, 5.0);
                 }
                 list.glyph_quad(r, ts.icon_uv(Icon::Open), Rgba::WHITE, 0.0);
-                ui.hitboxes.push(Hitbox { area: r, action, drag: Some(id) });
+                ui.hitboxes.push(Hitbox { area: r, action, drag: DragKind::Node(id) });
             }
         }
 
@@ -585,7 +667,7 @@ fn draw_navigation(
     );
     // The bar swallows clicks: rows hidden beneath it can't be clicked or
     // dragged. Pushed before the buttons so they still win (reverse scan).
-    ui.hitboxes.push(Hitbox { area: band, action: Action::None, drag: None });
+    ui.hitboxes.push(Hitbox { area: band, action: Action::None, drag: DragKind::None });
 
     let mut ox = 20.0;
     let oy = 20.0;
@@ -605,14 +687,14 @@ fn draw_navigation(
             list.rect(inflate(r, 5.0), HOVER_BUTTON_BG, 5.0);
         }
         list.glyph_quad(r, ts.icon_uv(icon), Rgba::WHITE, 0.0);
-        ui.hitboxes.push(Hitbox { area: r, action, drag: None });
+        ui.hitboxes.push(Hitbox { area: r, action, drag: DragKind::None });
         ox += size + padding;
     }
 
     // URL bar: y 16, height 31, to width-20 (draw_navigation's abwh quirk).
     let url_bar = Rect::from_xywh(ox, 16.0, window.x - ox - padding, 31.0);
     ui.url_bar_rect = url_bar;
-    ui.hitboxes.push(Hitbox { area: url_bar, action: Action::UrlBar, drag: None });
+    ui.hitboxes.push(Hitbox { area: url_bar, action: Action::UrlBar, drag: DragKind::None });
     let focused = ui.url.active;
     list.rect_stroke(url_bar, Rgba::WHITE, 5.0, if focused { 2.0 } else { 1.0 });
 

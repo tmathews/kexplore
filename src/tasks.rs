@@ -19,7 +19,9 @@ pub enum TaskResult {
         result: io::Result<Vec<ItemData>>,
     },
     PreviewDone {
-        gen: u64,
+        node: NodeId,
+        item: usize,
+        path: PathBuf,
         image: Option<crate::preview::DecodedImage>,
     },
 }
@@ -57,11 +59,6 @@ impl Tasks {
         unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
     }
 
-    /// Sender + wake fd for long-lived workers (the preview thread).
-    pub fn result_sender(&self) -> (mpsc::Sender<TaskResult>, RawFd) {
-        (self.tx.clone(), self.wake_write)
-    }
-
     /// Scan `path` on an ephemeral worker thread; the result is applied on
     /// the main thread only if (node, item) still resolves and is still
     /// marked scanning.
@@ -77,6 +74,25 @@ impl Tasks {
             }
             let result = model::scan_dir(&path);
             if tx.send(TaskResult::ScanDone { node, item, path, result }).is_ok() {
+                Self::wake_fd(wake_fd);
+            }
+        });
+    }
+
+    /// Decode an image preview for `path` on an ephemeral worker; the result
+    /// is applied on the main thread only if (node, item) still resolves and
+    /// is still marked preview_loading.
+    pub fn spawn_preview(&self, node: NodeId, item: usize, path: PathBuf) {
+        let tx = self.tx.clone();
+        let wake_fd = self.wake_write;
+        std::thread::spawn(move || {
+            if let Some(ms) =
+                std::env::var("KEXPLORE_SCAN_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            let image = crate::preview::decode(&path);
+            if tx.send(TaskResult::PreviewDone { node, item, path, image }).is_ok() {
                 Self::wake_fd(wake_fd);
             }
         });

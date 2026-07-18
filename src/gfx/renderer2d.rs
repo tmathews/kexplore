@@ -46,7 +46,9 @@ pub struct Vertex {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TexSlot {
     Atlas,
-    Preview,
+    /// A registered per-node texture (image preview), addressed by an opaque
+    /// id that indexes `TexSets::previews`. Keeps vk handles out of ui/model.
+    Tex(u32),
     /// Offscreen canvas texture, composited by the overlay pass.
     Scene,
     /// Blurred toolbar band.
@@ -54,20 +56,21 @@ pub enum TexSlot {
 }
 
 /// Descriptor sets for each slot a draw list may reference. Missing optional
-/// slots fall back to the atlas (harmless: nothing meaningful samples them).
+/// slots (and out-of-range preview ids) fall back to the atlas — harmless:
+/// nothing meaningful samples them.
 #[derive(Clone, Copy)]
-pub struct TexSets {
+pub struct TexSets<'a> {
     pub atlas: vk::DescriptorSet,
-    pub preview: Option<vk::DescriptorSet>,
+    pub previews: &'a [vk::DescriptorSet],
     pub scene: Option<vk::DescriptorSet>,
     pub blur: Option<vk::DescriptorSet>,
 }
 
-impl TexSets {
+impl TexSets<'_> {
     fn get(&self, slot: TexSlot) -> vk::DescriptorSet {
         match slot {
             TexSlot::Atlas => self.atlas,
-            TexSlot::Preview => self.preview.unwrap_or(self.atlas),
+            TexSlot::Tex(i) => self.previews.get(i as usize).copied().unwrap_or(self.atlas),
             TexSlot::Scene => self.scene.unwrap_or(self.atlas),
             TexSlot::Blur => self.blur.unwrap_or(self.atlas),
         }
@@ -234,8 +237,9 @@ impl DrawList {
     }
 
     /// Textured RGBA quad (the preview image).
-    pub fn image(&mut self, r: Rect) {
-        self.image_slot(r, TexSlot::Preview);
+    /// Textured quad sampling a registered per-node texture (image preview).
+    pub fn image_tex(&mut self, r: Rect, tex: u32) {
+        self.image_slot(r, TexSlot::Tex(tex));
     }
 
     /// Full-uv textured quad sampling an arbitrary slot (scene composite,
@@ -578,7 +582,7 @@ impl Renderer2d {
         frame_idx: usize,
         list: &DrawList,
         base: u32,
-        sets: &TexSets,
+        sets: &TexSets<'_>,
     ) {
         if list.is_empty() {
             return;

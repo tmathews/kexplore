@@ -22,7 +22,7 @@ use gfx::renderer2d::{DrawList, Renderer2d, TexSets};
 use gfx::upload::{self, PendingUpload, Texture};
 use model::{NodeArena, NodeId};
 use platform::wayland::KeyEvent;
-use preview::Preview;
+use std::collections::HashSet;
 use tasks::{TaskResult, Tasks};
 use text::TextSystem;
 use textfield::TextField;
@@ -32,17 +32,54 @@ use xkbcommon::xkb::keysyms as ks;
 
 const CARET_BLINK_MS: u64 = 530;
 
-/// The current preview texture plus textures waiting out their last
-/// possibly-in-flight frames before destruction.
-struct PreviewTex {
-    current: Option<(Texture, vk::DescriptorSet, (u32, u32))>,
+struct PreviewSlot {
+    tex: Texture,
+    set: vk::DescriptorSet,
+}
+
+/// Owns every image-preview texture. Preview nodes reference a slot by its
+/// opaque index; when a node is closed (its index no longer appears among the
+/// arena's preview nodes) the texture is retired and destroyed after the last
+/// in-flight frame that could still sample it.
+struct PreviewTextures {
+    slots: Vec<Option<PreviewSlot>>,
+    free: Vec<u32>,
     retired: Vec<(u64, Texture, vk::DescriptorSet)>,
 }
 
-impl PreviewTex {
-    fn retire_current(&mut self, frame_counter: u64) {
-        if let Some((tex, set, _)) = self.current.take() {
-            self.retired.push((frame_counter, tex, set));
+impl PreviewTextures {
+    fn new() -> PreviewTextures {
+        PreviewTextures { slots: Vec::new(), free: Vec::new(), retired: Vec::new() }
+    }
+
+    /// Register a texture, returning its opaque id (reusing a freed slot when
+    /// possible).
+    fn alloc(&mut self, tex: Texture, set: vk::DescriptorSet) -> u32 {
+        let slot = PreviewSlot { tex, set };
+        if let Some(id) = self.free.pop() {
+            self.slots[id as usize] = Some(slot);
+            id
+        } else {
+            self.slots.push(Some(slot));
+            (self.slots.len() - 1) as u32
+        }
+    }
+
+    /// Descriptor table indexed by texture id, for `TexSets::previews`. Empty
+    /// or retired slots resolve to the atlas (never actually sampled).
+    fn table(&self, atlas: vk::DescriptorSet) -> Vec<vk::DescriptorSet> {
+        self.slots.iter().map(|s| s.as_ref().map(|s| s.set).unwrap_or(atlas)).collect()
+    }
+
+    /// Retire any slot whose id is no longer referenced by a live preview
+    /// node; its texture drains the in-flight frames before destruction.
+    fn retire_unused(&mut self, live: &HashSet<u32>, frame_counter: u64) {
+        for i in 0..self.slots.len() as u32 {
+            if self.slots[i as usize].is_some() && !live.contains(&i) {
+                let s = self.slots[i as usize].take().unwrap();
+                self.retired.push((frame_counter, s.tex, s.set));
+                self.free.push(i);
+            }
         }
     }
 
@@ -56,6 +93,15 @@ impl PreviewTex {
                 true
             }
         });
+    }
+
+    unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        for slot in self.slots.drain(..).flatten() {
+            upload::destroy_texture(device, &slot.tex);
+        }
+        for (_, tex, _) in &self.retired {
+            upload::destroy_texture(device, tex);
+        }
     }
 }
 
@@ -116,8 +162,7 @@ fn main() {
         eprintln!("failed to init task system: {e}");
         std::process::exit(1);
     });
-    let preview = Preview::new(&tasks);
-    let mut ptex = PreviewTex { current: None, retired: Vec::new() };
+    let mut ptex = PreviewTextures::new();
     let mut extra_uploads: Vec<PendingUpload> = Vec::new();
     let mut frame_counter: u64 = 0;
 
@@ -179,27 +224,38 @@ fn main() {
         tasks.drain_wake();
         while let Ok(result) = tasks.rx.try_recv() {
             match result {
-                TaskResult::PreviewDone { gen, image } => {
-                    // Stale generations are dropped: the shown preview always
-                    // matches the latest selection.
-                    if gen == preview.current_gen() {
-                        ptex.retire_current(frame_counter);
-                        if let Some(img) = image {
-                            match make_preview_texture(&gfx, &renderer, &img) {
-                                Ok((tex, set)) => {
-                                    extra_uploads.push(PendingUpload {
-                                        texture_image: tex.image,
-                                        bytes: img.rgba,
-                                        x: 0,
-                                        y: 0,
-                                        width: img.width,
-                                        height: img.height,
-                                        initialized: false,
-                                    });
-                                    ptex.current = Some((tex, set, (img.width, img.height)));
-                                }
-                                Err(e) => eprintln!("preview texture failed: {e}"),
+                TaskResult::PreviewDone { node, item, path, image } => {
+                    // Drop if the item vanished or its request was superseded.
+                    let still_loading = arena
+                        .get(node)
+                        .and_then(|n| n.items.get(item))
+                        .is_some_and(|it| it.preview_loading && it.child.is_none());
+                    if let Some(n) = arena.get_mut(node) {
+                        if let Some(it) = n.items.get_mut(item) {
+                            it.preview_loading = false;
+                        }
+                    }
+                    if let (true, Some(img)) = (still_loading, image) {
+                        match make_preview_texture(&gfx, &renderer, &img) {
+                            Ok((tex, set)) => {
+                                extra_uploads.push(PendingUpload {
+                                    texture_image: tex.image,
+                                    bytes: img.rgba,
+                                    x: 0,
+                                    y: 0,
+                                    width: img.width,
+                                    height: img.height,
+                                    initialized: false,
+                                });
+                                let tex_id = ptex.alloc(tex, set);
+                                let (lw, lh) = platform.logical_size;
+                                let win = Point::new(lw as f32, lh as f32);
+                                spawn_preview_node(
+                                    &mut arena, &mut ui, node, item, path, tex_id,
+                                    img.width, img.height, win,
+                                );
                             }
+                            Err(e) => eprintln!("preview texture failed: {e}"),
                         }
                     }
                 }
@@ -270,9 +326,9 @@ fn main() {
                         if path.is_dir()
                             && reroot(&mut arena, &mut ui, &mut ts, &mut root, path, window)
                         {
+                            // reroot closes the old tree (preview nodes with
+                            // it); their textures retire next frame.
                             ui.url.cancel();
-                            preview.cancel();
-                            ptex.retire_current(frame_counter);
                         }
                         // Invalid path: stay in the editor so it can be fixed.
                         dirty = true;
@@ -312,21 +368,17 @@ fn main() {
                 blink_epoch = Instant::now();
                 dirty = true;
             } else {
-                let clear_preview = handle_action(
+                handle_action(
                     action,
                     double,
                     &mut arena,
                     &mut ui,
                     &tasks,
-                    &preview,
                     &file_handlers,
                     &mut children,
                     root,
                     window,
                 );
-                if clear_preview {
-                    ptex.retire_current(frame_counter);
-                }
                 dirty = true;
             }
         }
@@ -362,7 +414,6 @@ fn main() {
             let mut overlay = DrawList::new(scale);
             ts.begin_frame();
             let spin_angle = start.elapsed().as_secs_f32() * 12.0;
-            let preview_dims = ptex.current.as_ref().map(|(_, _, d)| *d);
             let out = ui::build_frame(
                 &mut ui,
                 &mut arena,
@@ -372,16 +423,16 @@ fn main() {
                 &mut overlay,
                 window,
                 spin_angle,
-                preview_dims,
                 caret_visible,
             );
             animating = out.animating || ui.refocus || nodes_moving;
 
             let mut uploads = std::mem::take(&mut ts.pending);
             uploads.append(&mut extra_uploads);
+            let prev_table = ptex.table(atlas_set);
             let sets = TexSets {
                 atlas: atlas_set,
-                preview: ptex.current.as_ref().map(|(_, s, _)| *s),
+                previews: &prev_table,
                 scene: Some(scene_set),
                 blur: Some(blur_set),
             };
@@ -406,6 +457,10 @@ fn main() {
             });
             if recorded {
                 frame_counter += 1;
+                // Free textures of any preview node that was closed.
+                let live: HashSet<u32> =
+                    arena.iter().filter_map(|(_, n)| n.preview.map(|p| p.tex)).collect();
+                ptex.retire_unused(&live, frame_counter);
                 ptex.destroy_old(&gfx.device, &renderer, frame_counter);
             } else {
                 // Never recorded (acquire failed): keep the uploads for the
@@ -442,12 +497,7 @@ fn main() {
     unsafe {
         gfx.device.device_wait_idle().ok();
         upload::destroy_texture(&gfx.device, &ts.texture);
-        if let Some((tex, _, _)) = &ptex.current {
-            upload::destroy_texture(&gfx.device, tex);
-        }
-        for (_, tex, _) in &ptex.retired {
-            upload::destroy_texture(&gfx.device, tex);
-        }
+        ptex.destroy_all(&gfx.device);
     }
     renderer.destroy(&gfx.device);
 }
@@ -598,37 +648,40 @@ fn handle_action(
     arena: &mut NodeArena,
     ui: &mut Ui,
     tasks: &Tasks,
-    preview: &Preview,
     file_handlers: &[handlers::Handler],
     children: &mut Vec<std::process::Child>,
     root: NodeId,
     window: Point,
-) -> bool {
+) {
     match action {
         Action::Row { node, item } => {
-            let Some(n) = arena.get(node) else { return false };
-            let Some(it) = n.items.get(item) else { return false };
+            let Some(n) = arena.get(node) else { return };
+            let Some(it) = n.items.get(item) else { return };
             ui.selection = Some((node, item));
             let path = n.path.join(&it.name);
             ui.selected_path = Some(path.clone());
             let is_dir = it.is_dir;
-            // Directories open on double click; a single click only selects.
+            // Double-click opens: directories scan into a node, previewable
+            // files decode into an image node. A single click only selects.
             let can_scan = double && is_dir && it.child.is_none() && !it.scanning;
-            // Any selection change invalidates in-flight preview decodes.
-            if !is_dir && preview::previewable(&path) {
-                preview.request(path.clone());
-            } else {
-                preview.cancel();
-            }
-            // Marking `scanning` before spawning both shows the spinner and
-            // dedups double-clicks (the C version raced two threads here).
+            let can_preview = double
+                && !is_dir
+                && it.child.is_none()
+                && !it.preview_loading
+                && preview::previewable(&path);
+            // Marking the in-flight flag before spawning both shows the
+            // spinner and dedups double-clicks (the C version raced here).
             if can_scan {
                 if let Some(n) = arena.get_mut(node) {
                     n.items[item].scanning = true;
                 }
                 tasks.spawn_scan(node, item, path);
+            } else if can_preview {
+                if let Some(n) = arena.get_mut(node) {
+                    n.items[item].preview_loading = true;
+                }
+                tasks.spawn_preview(node, item, path);
             }
-            return true;
         }
         Action::CloseNode { node } => {
             arena.close_recursive(node);
@@ -662,7 +715,7 @@ fn handle_action(
             // Focus the item row in the parent that owns the selection's
             // node (the C version's intent; its math added the wrong base).
             if let Some((node, _)) = ui.selection {
-                let Some(n) = arena.get(node) else { return false };
+                let Some(n) = arena.get(node) else { return };
                 if let Some((pid, pidx)) = n.parent {
                     if let Some(p) = arena.get(pid) {
                         if let Some(pit) = p.items.get(pidx) {
@@ -710,8 +763,8 @@ fn handle_action(
             }
         }
         Action::OpenWith { node, item } => {
-            let Some(n) = arena.get(node) else { return false };
-            let Some(it) = n.items.get(item) else { return false };
+            let Some(n) = arena.get(node) else { return };
+            let Some(it) = n.items.get(item) else { return };
             let path = n.path.join(&it.name);
             match handlers::find_handler(file_handlers, &path) {
                 Some(h) => {
@@ -722,10 +775,54 @@ fn handle_action(
                 None => eprintln!("no handler for {}", path.display()),
             }
         }
-        // UrlBar is handled inline in the main loop (needs text/caret state).
-        Action::NodeBody | Action::None | Action::UrlBar => {}
+        // UrlBar is handled inline in the main loop (needs text/caret state);
+        // ResizePreview is press-driven in process_input, nothing on click.
+        Action::NodeBody | Action::None | Action::UrlBar | Action::ResizePreview { .. } => {}
     }
-    false
+}
+
+/// Attach a decoded image as a preview node hanging off `(node, item)`: sized
+/// to the image aspect (capped to the safe area), placed to the right of the
+/// row like a directory child, and collision-resolved so it doesn't land on
+/// an existing node.
+#[allow(clippy::too_many_arguments)]
+fn spawn_preview_node(
+    arena: &mut NodeArena,
+    ui: &mut Ui,
+    node: NodeId,
+    item: usize,
+    path: PathBuf,
+    tex: u32,
+    img_w: u32,
+    img_h: u32,
+    window: Point,
+) {
+    let Some(p) = arena.get(node) else { return };
+    let item_y = p.items.get(item).map(|it| it.rect.min.y).unwrap_or(0.0);
+    let origin = Point::new(p.rect.max.x + 20.0, p.rect.min.y + item_y - p.scroll);
+    let cap = ui::node_max_size(window);
+    let aspect = (img_w.max(1) as f32) / (img_h.max(1) as f32);
+    let mut w = 320.0_f32.min(cap.x);
+    let mut h = w / aspect;
+    if h > cap.y {
+        h = cap.y;
+        w = h * aspect;
+    }
+    let rect = geom::Rect::from_xywh(origin.x, origin.y, w, h);
+    let child_id = arena.insert(model::preview_node(path, (node, item), tex, img_w, img_h, rect));
+    if let Some(n) = arena.get_mut(node) {
+        n.items[item].child = Some(child_id);
+    }
+    // Collision-resolve down/right, like a freshly opened directory.
+    let obstacles: Vec<geom::Rect> =
+        arena.iter().filter(|(id, _)| *id != child_id).map(|(_, n)| n.rect).collect();
+    let target = model::resolve_collision(rect, &obstacles, false);
+    if target != rect {
+        if let Some(c) = arena.get_mut(child_id) {
+            c.anim_to = Some(target.min);
+        }
+    }
+    ui.ensure_visible(target, window);
 }
 
 /// Apply a worker result on the main thread. The generational id check

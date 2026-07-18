@@ -34,6 +34,19 @@ pub struct Node {
     /// When set, the box glides its min corner toward this point (collision
     /// resolve after an open or a drag-release); cleared on arrival.
     pub anim_to: Option<Point>,
+    /// Some for image-preview nodes: they draw a texture instead of rows and
+    /// resize by the corner handle. Directory nodes leave this None.
+    pub preview: Option<PreviewData>,
+}
+
+/// State for an image-preview node.
+#[derive(Clone, Copy)]
+pub struct PreviewData {
+    /// Opaque texture id, indexing the descriptor table owned by main.rs.
+    pub tex: u32,
+    /// Intrinsic image size in pixels (for aspect-locked resize).
+    pub img_w: u32,
+    pub img_h: u32,
 }
 
 pub struct Item {
@@ -47,6 +60,8 @@ pub struct Item {
     pub child: Option<NodeId>,
     /// A directory scan is in flight for this item (spinner + click dedup).
     pub scanning: bool,
+    /// An image-preview decode is in flight for this item (spinner + dedup).
+    pub preview_loading: bool,
 }
 
 /// Plain data produced by a directory scan (safe to send from workers).
@@ -166,6 +181,7 @@ pub fn node_from_items(path: PathBuf, data: Vec<ItemData>) -> Node {
             rect: Rect::ZERO,
             child: None,
             scanning: false,
+            preview_loading: false,
         })
         .collect();
     Node {
@@ -177,6 +193,31 @@ pub fn node_from_items(path: PathBuf, data: Vec<ItemData>) -> Node {
         content_h: 0.0,
         scroll: 0.0,
         anim_to: None,
+        preview: None,
+    }
+}
+
+/// Build an image-preview node (no rows) sized to `rect`. Attached to a file
+/// item via `parent`; draws texture `tex` and resizes aspect-locked from the
+/// intrinsic `img_w`/`img_h`.
+pub fn preview_node(
+    path: PathBuf,
+    parent: (NodeId, usize),
+    tex: u32,
+    img_w: u32,
+    img_h: u32,
+    rect: Rect,
+) -> Node {
+    Node {
+        path,
+        items: Vec::new(),
+        parent: Some(parent),
+        rect,
+        content_w: rect.width(),
+        content_h: rect.height(),
+        scroll: 0.0,
+        anim_to: None,
+        preview: Some(PreviewData { tex, img_w, img_h }),
     }
 }
 
