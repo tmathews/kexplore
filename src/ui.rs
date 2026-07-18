@@ -4,7 +4,7 @@
 //! returns a typed Action instead of the C trigger/type magic ints.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::geom::{Point, Rect};
 use crate::gfx::renderer2d::{DrawList, Rgba, TexSlot};
@@ -454,11 +454,14 @@ pub fn build_frame(
     // The 90% box cap is in world units (zoom-independent), based on window.
     let cap = node_max_size(window);
     let path = path_nodes(arena, ui.selection);
+    // The current canvas root's path is the URL bar's default when nothing is
+    // selected (there is always a node open).
+    let root_path = arena.get(root).map(|n| n.path.clone());
     // Connectors are emitted first so every node box paints over them — the
     // lines pass *under* the nodes rather than across their content.
-    draw_connectors(arena, root, canvas, view, cap);
+    draw_connectors(arena, root, canvas, view, cap, &path);
     draw_entries(ui, arena, root, ts, canvas, view, spin_angle, &path, &mut out);
-    draw_navigation(ui, ts, overlay, window, caret_visible);
+    draw_navigation(ui, ts, overlay, window, caret_visible, root_path.as_deref());
     out
 }
 
@@ -490,6 +493,7 @@ fn draw_connectors(
     list: &mut DrawList,
     view: View,
     cap: Point,
+    path: &HashSet<NodeId>,
 ) {
     let (node_rect, scroll) = {
         let Some(node) = arena.get_mut(id) else { return };
@@ -522,10 +526,15 @@ fn draw_connectors(
                 max: Point::new(a.x.max(b.x), a.y.max(b.y)),
             };
             if visible.intersects(seg) {
-                list.line(view.w2s(a), view.w2s(b), 3.0, Rgba::WHITE);
+                // Highlight the line amber when it is an edge of the active
+                // route (its child node is on the selection path).
+                let color =
+                    if path.contains(&child_id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
+                let width = if path.contains(&child_id) { 4.0 } else { 3.0 };
+                list.line(view.w2s(a), view.w2s(b), width, color);
             }
         }
-        draw_connectors(arena, child_id, list, view, cap);
+        draw_connectors(arena, child_id, list, view, cap, path);
     }
 }
 
@@ -737,6 +746,7 @@ fn draw_navigation(
     list: &mut DrawList,
     window: Point,
     caret_visible: bool,
+    active_path: Option<&Path>,
 ) {
     // Composite the offscreen canvas, then the blurred band under the bar.
     list.image_slot(Rect::from_xywh(0.0, 0.0, window.x, window.y), TexSlot::Scene);
@@ -822,7 +832,9 @@ fn draw_navigation(
             }
         }
     } else {
-        let text = match &ui.selected_path {
+        // Show the selected path, or fall back to the active (root) node's
+        // path so the bar always reflects where you are.
+        let text = match ui.selected_path.as_deref().or(active_path) {
             Some(p) => p.to_string_lossy().into_owned(),
             None => "No selection...".to_string(),
         };

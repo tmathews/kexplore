@@ -351,12 +351,14 @@ fn main() {
         platform.end_input_frame();
         if let Some((action, double)) = action {
             if matches!(action, Action::UrlBar) {
-                // Focus the field (seeding it with the selected path) and
-                // put the caret at the click position.
+                // Focus the field (seeding it with the selected path, or the
+                // active root path when nothing is selected) and put the caret
+                // at the click position.
                 if !ui.url.active {
                     let initial = ui
                         .selected_path
-                        .as_ref()
+                        .clone()
+                        .or_else(|| arena.get(root).map(|n| n.path.clone()))
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     ui.url.begin(initial, 0);
