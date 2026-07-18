@@ -457,8 +457,9 @@ pub fn build_frame(
     // The current canvas root's path is the URL bar's default when nothing is
     // selected (there is always a node open).
     let root_path = arena.get(root).map(|n| n.path.clone());
-    // Connectors are emitted first so every node box paints over them — the
-    // lines pass *under* the nodes rather than across their content.
+    // Background grid first, then connectors, so every node box paints over
+    // both — grid and lines pass *under* the nodes.
+    draw_grid(canvas, view);
     draw_connectors(arena, root, canvas, view, cap, &path);
     draw_entries(ui, arena, root, ts, canvas, view, spin_angle, &path, &mut out);
     draw_navigation(ui, ts, overlay, window, caret_visible, root_path.as_deref());
@@ -484,8 +485,64 @@ fn path_nodes(arena: &NodeArena, selection: Option<(NodeId, usize)>) -> HashSet<
     set
 }
 
-/// Re-clamp every node and emit the parent→child connector lines. Kept
-/// separate from `draw_entries` so all lines land in the draw list before any
+/// Faint background grid, in world space so it pans and zooms with the
+/// canvas. Spacing steps by powers of two as you zoom so the on-screen density
+/// stays roughly constant; every 4th line is a touch brighter.
+fn draw_grid(list: &mut DrawList, view: View) {
+    const BASE: f32 = 64.0; // world px between minor lines at 1:1
+    const MIN_SCREEN: f32 = 22.0; // keep on-screen spacing at least this
+    const MAJOR_EVERY: f32 = 4.0;
+    let minor = Rgba::new(1.0, 1.0, 1.0, 0.035);
+    let major = Rgba::new(1.0, 1.0, 1.0, 0.07);
+    let mut spacing = BASE;
+    while spacing * view.zoom < MIN_SCREEN {
+        spacing *= 2.0;
+    }
+    let vis = view.visible();
+    let win = view.window;
+    let color_for = |n: f32| if (n % MAJOR_EVERY).abs() < 0.5 { major } else { minor };
+    // Vertical lines span the full height; horizontal span the full width.
+    let mut x = (vis.min.x / spacing).floor() * spacing;
+    while x <= vis.max.x {
+        let sx = (x - view.cam.x) * view.zoom;
+        list.line(Point::new(sx, 0.0), Point::new(sx, win.y), 1.0, color_for((x / spacing).round()));
+        x += spacing;
+    }
+    let mut y = (vis.min.y / spacing).floor() * spacing;
+    while y <= vis.max.y {
+        let sy = (y - view.cam.y) * view.zoom;
+        list.line(Point::new(0.0, sy), Point::new(win.x, sy), 1.0, color_for((y / spacing).round()));
+        y += spacing;
+    }
+}
+
+/// A smooth cubic-bezier "wire" from `a` (parent edge) to `b` (child edge),
+/// leaving and arriving horizontally. Sampled in world space and emitted as
+/// short segments via `view`.
+fn draw_curve(list: &mut DrawList, view: View, a: Point, b: Point, width: f32, color: Rgba) {
+    const SEGMENTS: usize = 24;
+    // Horizontal control-point reach: half the span, with a floor so short
+    // hops still bow out a little.
+    let cx = ((b.x - a.x).abs() * 0.5).max(30.0);
+    let p1 = Point::new(a.x + cx, a.y);
+    let p2 = Point::new(b.x - cx, b.y);
+    let mut prev = view.w2s(a);
+    for i in 1..=SEGMENTS {
+        let t = i as f32 / SEGMENTS as f32;
+        let u = 1.0 - t;
+        let (w0, w1, w2, w3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+        let p = Point::new(
+            w0 * a.x + w1 * p1.x + w2 * p2.x + w3 * b.x,
+            w0 * a.y + w1 * p1.y + w2 * p2.y + w3 * b.y,
+        );
+        let ps = view.w2s(p);
+        list.line(prev, ps, width, color);
+        prev = ps;
+    }
+}
+
+/// Re-clamp every node and emit the parent→child connector wires. Kept
+/// separate from `draw_entries` so all wires land in the draw list before any
 /// box, guaranteeing they render beneath the nodes.
 fn draw_connectors(
     arena: &mut NodeArena,
@@ -526,12 +583,12 @@ fn draw_connectors(
                 max: Point::new(a.x.max(b.x), a.y.max(b.y)),
             };
             if visible.intersects(seg) {
-                // Highlight the line amber when it is an edge of the active
+                // Highlight the wire amber when it is an edge of the active
                 // route (its child node is on the selection path).
                 let color =
                     if path.contains(&child_id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
                 let width = if path.contains(&child_id) { 4.0 } else { 3.0 };
-                list.line(view.w2s(a), view.w2s(b), width, color);
+                draw_curve(list, view, a, b, width, color);
             }
         }
         draw_connectors(arena, child_id, list, view, cap, path);
