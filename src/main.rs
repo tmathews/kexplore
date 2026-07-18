@@ -160,6 +160,11 @@ fn main() {
     let mut ui = Ui::new();
     // Open the chain of nodes down to home and focus it; snap (no startup pan).
     navigate_to(&mut arena, &mut ui, &mut ts, root, &home, window0);
+    // Pin the landing node (and its chain) so browsing elsewhere doesn't
+    // collapse the home view the app opened to.
+    if let Some(active) = ui.active_node {
+        pin_node(&mut arena, active);
+    }
     ui.camera = ui.camera_target;
     ui.refocus = false;
 
