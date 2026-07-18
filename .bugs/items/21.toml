@@ -1,0 +1,16 @@
+id = 21
+kind = "todo"
+title = "Pinch-to-zoom: enable once kwm forwards 2-finger pinch"
+description = """
+kexplore's pinch-to-zoom (zwp_pointer_gestures_v1, Ui::pinch_zoom) is implemented and correct, but does not work under the user's WM kwm because kwm keeps touchpad gestures for its own nav. kwm's gesture_focus_wants (apps/kwm/input.c) forwards swipe/pinch/hold to a client only when KWM_FORWARD_GESTURES is set AND the client is fullscreen; kwm uses 3-finger swipe for grid nav and 4-finger for overview, and does not use pinch at all (so it is dropped for windowed apps).
+
+Facts: pinch can be 2/3/4 fingers and libinput reports the count (event->fingers, forwarded by kwm into pinch_begin). 2-finger parallel motion = scroll/axis (already forwarded, drives our 2-finger pan); 2-finger distance change = pinch gesture (kept by kwm).
+
+BLOCKED ON kwm: the user is designing kwm's gesture-ownership policy (may want pinch for grid nav later). Pick this up once kwm distinguishes 2-finger vs 3+ finger gestures and forwards 2-finger pinch to windowed clients. Then verify pinch-to-zoom in kexplore end to end; optionally add a 2-finger-only guard in kexplore's pinch Begin handler (it currently ignores the fingers count).
+
+2-finger pan already works (axis-based); direction was flipped to grab-style in 03072f4."""
+author = "Claude Opus 4.8 (agent) <agent@bug-catcher>"
+severity = 3
+state = "open"
+created_at = "2026-07-18T04:57:33.277236096Z"
+updated_at = "2026-07-18T04:57:33.277238040Z"
