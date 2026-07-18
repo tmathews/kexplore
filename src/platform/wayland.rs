@@ -31,15 +31,34 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 pub const BTN_LEFT: u32 = 272;
+pub const BTN_RIGHT: u32 = 273;
 pub const BTN_MIDDLE: u32 = 274;
 
 /// MIME types we advertise when copying, and accept when pasting, in order of
 /// preference. All are plain UTF-8 text.
 const TEXT_MIMES: [&str; 4] =
     ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING"];
+/// MIME advertised for a "copy file" so file managers can paste the file.
+const URI_LIST_MIME: &str = "text/uri-list";
 
 fn is_text_mime(m: &str) -> bool {
     TEXT_MIMES.contains(&m) || m == "TEXT"
+}
+
+/// Build a `file://` URI from an absolute path, percent-encoding bytes that
+/// aren't URI-safe (RFC 3986 unreserved plus `/`).
+fn path_to_file_uri(path: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut uri = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        match b {
+            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                uri.push(b as char)
+            }
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri
 }
 
 #[derive(Clone, Copy, Default)]
@@ -52,6 +71,8 @@ pub struct PointerState {
     /// Middle button: held / just-pressed this iteration (canvas pan).
     pub middle_down: bool,
     pub middle_pressed: bool,
+    /// Right button pressed this iteration (opens the context menu).
+    pub right_pressed: bool,
     /// Accumulated scroll this iteration (positive dy = down, dx = right).
     pub scroll_dx: f64,
     pub scroll_dy: f64,
@@ -118,6 +139,9 @@ pub struct Platform {
     /// Text we currently own on the clipboard, written on demand when another
     /// client pastes; kept alive alongside `data_source`.
     clipboard: Option<String>,
+    /// When we own a "copy file" selection, the `text/uri-list` payload served
+    /// to file managers (the path is still served as plain text).
+    clipboard_uris: Option<String>,
     data_source: Option<wl_data_source::WlDataSource>,
     /// MIME types announced by the offer currently being described (before its
     /// `selection` event promotes it to the active one).
@@ -225,6 +249,7 @@ pub fn init(title: &str, app_id: &str, logical: (u32, u32)) -> Result<Init, Stri
         data_device,
         last_serial: 0,
         clipboard: None,
+        clipboard_uris: None,
         data_source: None,
         pending_mimes: Vec::new(),
         selection_offer: None,
@@ -302,6 +327,7 @@ impl Platform {
         self.pointer_state.pressed = false;
         self.pointer_state.released = false;
         self.pointer_state.middle_pressed = false;
+        self.pointer_state.right_pressed = false;
         self.pointer_state.scroll_dx = 0.0;
         self.pointer_state.scroll_dy = 0.0;
         self.pointer_state.scroll_finger = false;
@@ -326,6 +352,27 @@ impl Platform {
         }
         dd.set_selection(Some(&source), self.last_serial);
         self.clipboard = Some(text);
+        self.clipboard_uris = None;
+        self.data_source = Some(source);
+    }
+
+    /// Take ownership of the clipboard as a "copy file": offers a
+    /// `text/uri-list` (so file managers paste the file) plus the path as plain
+    /// text. No-op if the data-device protocol is unavailable.
+    pub fn set_clipboard_file(&mut self, qh: &QueueHandle<Self>, path: &std::path::Path) {
+        let (Some(mgr), Some(dd)) = (&self.data_device_mgr, &self.data_device) else {
+            return;
+        };
+        let uri = path_to_file_uri(path);
+        let source = mgr.create_data_source(qh, ());
+        source.offer(URI_LIST_MIME.to_string());
+        for m in TEXT_MIMES {
+            source.offer(m.to_string());
+        }
+        dd.set_selection(Some(&source), self.last_serial);
+        // uri-list entries are CRLF-terminated per RFC 2483.
+        self.clipboard_uris = Some(format!("{uri}\r\n"));
+        self.clipboard = Some(path.to_string_lossy().into_owned());
         self.data_source = Some(source);
     }
 
@@ -688,6 +735,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Platform {
                         }
                         _ => {}
                     }
+                } else if button == BTN_RIGHT {
+                    if let WEnum::Value(wl_pointer::ButtonState::Pressed) = btn_state {
+                        state.pointer_state.right_pressed = true;
+                    }
                 }
             }
             // AxisSource precedes the Axis events of a scroll frame; it tells
@@ -818,11 +869,16 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for Platform {
             // Another client is pasting: write our text to the pipe fd. The
             // payload is small (paths/URLs), so a blocking write is fine.
             wl_data_source::Event::Send { mime_type, fd } => {
-                if is_text_mime(&mime_type) {
-                    if let Some(text) = &state.clipboard {
-                        let mut file = std::fs::File::from(fd);
-                        let _ = file.write_all(text.as_bytes());
-                    }
+                let payload = if mime_type == URI_LIST_MIME {
+                    state.clipboard_uris.as_deref()
+                } else if is_text_mime(&mime_type) {
+                    state.clipboard.as_deref()
+                } else {
+                    None
+                };
+                if let Some(payload) = payload {
+                    let mut file = std::fs::File::from(fd);
+                    let _ = file.write_all(payload.as_bytes());
                 }
             }
             // We lost ownership (someone else took the selection). Drop our copy
@@ -831,6 +887,7 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for Platform {
                 if state.data_source.as_ref() == Some(source) {
                     state.data_source = None;
                     state.clipboard = None;
+                    state.clipboard_uris = None;
                 }
                 source.destroy();
             }

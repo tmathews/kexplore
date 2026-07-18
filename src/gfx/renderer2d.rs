@@ -245,13 +245,19 @@ impl DrawList {
     /// Full-uv textured quad sampling an arbitrary slot (scene composite,
     /// blurred band).
     pub fn image_slot(&mut self, r: Rect, slot: TexSlot) {
+        self.image_slot_uv(r, slot, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// Textured quad sampling `slot` over the UV sub-region `uv` = [u0,v0,u1,v1]
+    /// (0..1). Used to sample a region of the full-screen blur behind a panel.
+    pub fn image_slot_uv(&mut self, r: Rect, slot: TexSlot, uv: [f32; 4]) {
         self.require_tex(slot);
         let s = self.scale;
         let (x0, y0) = (r.min.x * s, r.min.y * s);
         let (x1, y1) = (r.max.x * s, r.max.y * s);
         self.push_quad(
             [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
-            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            [[uv[0], uv[1]], [uv[2], uv[1]], [uv[2], uv[3]], [uv[0], uv[3]]],
             Rgba::WHITE,
             MODE_IMAGE,
             [0.0; 4],

@@ -45,6 +45,35 @@ pub enum Action {
     PinNode { node: NodeId },
     /// Press target for a node's corner resize handle.
     ResizeNode { node: NodeId },
+    /// A row in the right-click context menu (acts on `ui.context_menu`).
+    Menu(MenuItem),
+}
+
+/// The entries in the right-click context menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuItem {
+    Open,
+    OpenTerminal,
+    CopyFile,
+    CopyPath,
+}
+
+/// The menu rows, in display order.
+pub const MENU_ITEMS: [(MenuItem, &str); 4] = [
+    (MenuItem::Open, "Open"),
+    (MenuItem::OpenTerminal, "Open Terminal Here"),
+    (MenuItem::CopyFile, "Copy File"),
+    (MenuItem::CopyPath, "Copy File Path"),
+];
+
+/// An open right-click context menu, anchored at `pos` (screen px), acting on
+/// the row it was opened over.
+pub struct ContextMenu {
+    pub pos: Point,
+    pub node: NodeId,
+    pub item: usize,
+    pub path: PathBuf,
+    pub is_dir: bool,
 }
 
 /// What a press-drag on a hitbox does once it crosses the move threshold.
@@ -137,6 +166,10 @@ pub struct Ui {
     /// its last scroll event (a long gap ends the gesture).
     scroll_lock: ScrollLock,
     last_scroll: Option<std::time::Instant>,
+    /// The open right-click context menu, if any, and its drawn rect (screen
+    /// px, from the last frame) for click-away detection.
+    pub context_menu: Option<ContextMenu>,
+    menu_rect: Rect,
 }
 
 /// The world↔screen transform for canvas content. Screen/logical px; the
@@ -198,6 +231,8 @@ impl Ui {
             last_click: None,
             scroll_lock: ScrollLock::None,
             last_scroll: None,
+            context_menu: None,
+            menu_rect: Rect::ZERO,
         }
     }
 
@@ -327,6 +362,33 @@ impl Ui {
             dirty = true;
         }
 
+        // Right-click over a row opens the context menu there.
+        if pointer.right_pressed {
+            if let Some(Action::Row { node, item }) = hit.map(|h| h.action) {
+                if let Some(n) = arena.get(node) {
+                    if let Some(it) = n.items.get(item) {
+                        self.context_menu = Some(ContextMenu {
+                            pos: cursor,
+                            node,
+                            item,
+                            path: n.path.join(&it.name),
+                            is_dir: it.is_dir,
+                        });
+                        dirty = true;
+                    }
+                }
+            }
+        }
+
+        // A left press with the menu open and the cursor outside it dismisses
+        // the menu and is swallowed (it doesn't also act on the canvas).
+        let mut swallow_press = false;
+        if pointer.pressed && self.context_menu.is_some() && !self.menu_rect.contains(cursor) {
+            self.context_menu = None;
+            swallow_press = true;
+            dirty = true;
+        }
+
         // Touchpad pinch: zoom about the cursor, applied immediately (the
         // gesture is already continuous, so no extra smoothing).
         if pointer.pinch > 0.0 && (pointer.pinch - 1.0).abs() > 0.0001 {
@@ -404,7 +466,7 @@ impl Ui {
             }
         }
 
-        if pointer.pressed {
+        if pointer.pressed && !swallow_press {
             let kind = hit.map(|h| h.drag).unwrap_or(DragKind::None);
             self.drag = DragState::Pending { origin: cursor, kind };
         }
@@ -670,7 +732,86 @@ pub fn build_frame(
         canvas.rect_stroke(band, COLOR_MULTISELECT, 0.0, 1.0);
     }
     draw_navigation(ui, ts, overlay, window, caret_visible, root_path.as_deref());
+    // The context menu draws last of all, on top of the toolbar.
+    draw_context_menu(ui, ts, overlay, window);
     out
+}
+
+// Context-menu look: a frosted translucent panel with a soft shadow.
+const MENU_BG: Rgba = Rgba([24, 24, 28, 205]); // ~0.80 dark
+const MENU_BORDER: Rgba = Rgba([255, 255, 255, 40]);
+const MENU_HOVER: Rgba = Rgba([255, 191, 64, 90]); // amber, like row hover
+const MENU_RADIUS: f32 = 10.0;
+const MENU_PAD_Y: f32 = 6.0; // vertical padding at top/bottom of the list
+const MENU_ITEM_PAD_X: f32 = 14.0;
+const MENU_ITEM_PAD_Y: f32 = 6.0; // padding above/below each label
+
+/// Draw the open right-click context menu (frosted backdrop, soft shadow,
+/// rounded corners) into the overlay, and push its item hitboxes. Records the
+/// menu rect for next frame's click-away test.
+fn draw_context_menu(ui: &mut Ui, ts: &mut TextSystem, list: &mut DrawList, window: Point) {
+    let Some(menu) = &ui.context_menu else {
+        ui.menu_rect = Rect::ZERO;
+        return;
+    };
+    let lh = ts.line_height();
+    let item_h = lh + 2.0 * MENU_ITEM_PAD_Y;
+    let mut text_w = 0.0f32;
+    for (_, label) in MENU_ITEMS {
+        text_w = text_w.max(ts.measure(label).x);
+    }
+    let w = text_w + 2.0 * MENU_ITEM_PAD_X;
+    let h = item_h * MENU_ITEMS.len() as f32 + 2.0 * MENU_PAD_Y;
+    // Anchor at the cursor, clamped on-screen (and below the toolbar).
+    let x = menu.pos.x.min(window.x - w - 4.0).max(4.0);
+    let y = menu.pos.y.min(window.y - h - 4.0).max(TOOLBAR_H + 4.0);
+    let rect = Rect::from_xywh(x, y, w, h);
+    ui.menu_rect = rect;
+
+    // Soft drop shadow: concentric faint rounded rects, offset down.
+    const SHADOW_DY: f32 = 4.0;
+    for i in (1..=5).rev() {
+        let s = i as f32 * 2.0;
+        let sr = Rect {
+            min: Point::new(rect.min.x - s, rect.min.y - s + SHADOW_DY),
+            max: Point::new(rect.max.x + s, rect.max.y + s + SHADOW_DY),
+        };
+        list.rect(sr, Rgba::new(0.0, 0.0, 0.0, 0.10), MENU_RADIUS + s);
+    }
+    // Blurred backdrop, inset by the corner radius so its rectangular quad stays
+    // within the rounded shape (no sharp corners poking out).
+    let inset = inflate(rect, -MENU_RADIUS);
+    if inset.max.x > inset.min.x && inset.max.y > inset.min.y {
+        let uv = [
+            inset.min.x / window.x,
+            inset.min.y / window.y,
+            inset.max.x / window.x,
+            inset.max.y / window.y,
+        ];
+        list.image_slot_uv(inset, TexSlot::Blur, uv);
+    }
+    // Frosted fill + border.
+    list.rect(rect, MENU_BG, MENU_RADIUS);
+    list.rect_stroke(rect, MENU_BORDER, MENU_RADIUS, 1.0);
+
+    // A full-menu hitbox swallows clicks on padding (pushed before the items so
+    // they still win the reverse hit-test).
+    ui.hitboxes.push(Hitbox { area: rect, action: Action::None, drag: DragKind::None });
+    for (i, (item, label)) in MENU_ITEMS.iter().enumerate() {
+        let iy = y + MENU_PAD_Y + i as f32 * item_h;
+        let irow = Rect::from_xywh(x + 4.0, iy, w - 8.0, item_h);
+        let action = Action::Menu(*item);
+        if ui.hover == Some(action) {
+            list.rect(irow, MENU_HOVER, 6.0);
+        }
+        ts.draw(
+            list,
+            Point::new(x + MENU_ITEM_PAD_X, iy + MENU_ITEM_PAD_Y),
+            label,
+            Rgba::WHITE,
+        );
+        ui.hitboxes.push(Hitbox { area: irow, action, drag: DragKind::None });
+    }
 }
 
 /// The route highlighted amber (borders + connector wires): the active node
@@ -1171,10 +1312,11 @@ fn draw_navigation(
     caret_visible: bool,
     active_path: Option<&Path>,
 ) {
-    // Composite the offscreen canvas, then the blurred band under the bar.
+    // Composite the offscreen canvas, then the blurred band under the bar. The
+    // blur now covers the whole scene, so sample just its top strip here.
     list.image_slot(Rect::from_xywh(0.0, 0.0, window.x, window.y), TexSlot::Scene);
     let band = Rect::from_xywh(0.0, 0.0, window.x, TOOLBAR_H);
-    list.image_slot(band, TexSlot::Blur);
+    list.image_slot_uv(band, TexSlot::Blur, [0.0, 0.0, 1.0, (TOOLBAR_H / window.y).clamp(0.0, 1.0)]);
     // Lighter tint than the C 0.9 so the frosted backdrop reads through.
     list.solid(band, Rgba::new(0.0, 0.0, 0.0, 0.55));
     list.line(

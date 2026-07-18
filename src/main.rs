@@ -113,12 +113,13 @@ fn main() {
 
     let display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
     let surface_ptr = platform.surface.id().as_ptr() as *mut std::ffi::c_void;
-    let band_h = |scale: f64| (ui::TOOLBAR_H as f64 * scale).round().max(1.0) as u32;
+    // The frosted blur now covers the whole scene (so panels — the toolbar and
+    // the context menu — can blur anywhere), so its height is the full surface.
     let mut gfx = gfx::Gfx::new(
         display_ptr,
         surface_ptr,
         platform.physical_extent(),
-        band_h(platform.scale()),
+        platform.physical_extent().1,
     )
     .unwrap_or_else(|e| {
         eprintln!("failed to init vulkan: {e}");
@@ -286,7 +287,7 @@ fn main() {
             platform.apply_scale();
             ts.set_scale(platform.scale() as f32);
             if let Err(e) =
-                gfx.recreate_swapchain(platform.physical_extent(), band_h(platform.scale()))
+                gfx.recreate_swapchain(platform.physical_extent(), platform.physical_extent().1)
             {
                 eprintln!("swapchain recreate failed: {e}");
                 break;
@@ -415,6 +416,49 @@ fn main() {
                 if let Some(p) = ui.selected_path.as_ref().map(|p| p.to_string_lossy().into_owned()) {
                     platform.set_clipboard(&qh, p);
                 }
+            } else if let Action::Menu(item) = action {
+                // Context-menu row. Take (and close) the menu, then act on its
+                // target.
+                if let Some(menu) = ui.context_menu.take() {
+                    match item {
+                        ui::MenuItem::Open => {
+                            // Files open in their handler (double-click), dirs
+                            // open/focus their node (single-click).
+                            handle_action(
+                                Action::Row { node: menu.node, item: menu.item },
+                                !menu.is_dir,
+                                &mut arena,
+                                &mut ui,
+                                &ts,
+                                &tasks,
+                                &file_handlers,
+                                &mut children,
+                                window,
+                            );
+                        }
+                        ui::MenuItem::OpenTerminal => {
+                            let dir = if menu.path.is_dir() {
+                                menu.path.as_path()
+                            } else {
+                                menu.path.parent().unwrap_or(menu.path.as_path())
+                            };
+                            if let Err(e) = handlers::spawn(
+                                OsStr::new("foot"),
+                                &[OsStr::new("-D"), dir.as_os_str()],
+                                &mut children,
+                            ) {
+                                eprintln!("foot failed: {e}");
+                            }
+                        }
+                        ui::MenuItem::CopyFile => {
+                            platform.set_clipboard_file(&qh, &menu.path);
+                        }
+                        ui::MenuItem::CopyPath => {
+                            platform.set_clipboard(&qh, menu.path.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+                dirty = true;
             } else {
                 handle_action(
                     action,
@@ -524,7 +568,7 @@ fn main() {
                 Ok(true) => dirty = false,
                 Ok(false) => {
                     if let Err(e) =
-                        gfx.recreate_swapchain(platform.physical_extent(), band_h(platform.scale()))
+                        gfx.recreate_swapchain(platform.physical_extent(), platform.physical_extent().1)
                     {
                         eprintln!("swapchain recreate failed: {e}");
                         break;
@@ -868,14 +912,15 @@ fn handle_action(
                 }
             }
         }
-        // UrlBar, FocusHome, GoUp and CopyPath are handled inline in the main
-        // loop (they need text/caret state, navigate_to, or the platform
+        // UrlBar, FocusHome, GoUp, CopyPath and Menu are handled inline in the
+        // main loop (they need text/caret state, navigate_to, or the platform
         // clipboard); ResizeNode is press-driven.
         Action::None
         | Action::UrlBar
         | Action::FocusHome
         | Action::GoUp
         | Action::CopyPath
+        | Action::Menu(_)
         | Action::ResizeNode { .. } => {}
     }
 }
