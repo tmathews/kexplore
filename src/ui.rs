@@ -67,13 +67,16 @@ pub const MENU_ITEMS: [(MenuItem, &str); 4] = [
 ];
 
 /// An open right-click context menu, anchored at `pos` (screen px), acting on
-/// the row it was opened over.
+/// the file or directory it was opened over.
 pub struct ContextMenu {
     pub pos: Point,
-    pub node: NodeId,
-    pub item: usize,
     pub path: PathBuf,
     pub is_dir: bool,
+}
+
+/// The menu rows shown for a target: "Open" is offered only for files.
+pub fn menu_items_for(is_dir: bool) -> Vec<(MenuItem, &'static str)> {
+    MENU_ITEMS.iter().copied().filter(|(it, _)| !(is_dir && *it == MenuItem::Open)).collect()
 }
 
 /// What a press-drag on a hitbox does once it crosses the move threshold.
@@ -362,21 +365,20 @@ impl Ui {
             dirty = true;
         }
 
-        // Right-click over a row opens the context menu there.
+        // Right-click over a row or a node header opens the context menu there.
         if pointer.right_pressed {
-            if let Some(Action::Row { node, item }) = hit.map(|h| h.action) {
-                if let Some(n) = arena.get(node) {
-                    if let Some(it) = n.items.get(item) {
-                        self.context_menu = Some(ContextMenu {
-                            pos: cursor,
-                            node,
-                            item,
-                            path: n.path.join(&it.name),
-                            is_dir: it.is_dir,
-                        });
-                        dirty = true;
-                    }
+            let target = hit.and_then(|h| match h.action {
+                Action::Row { node, item } => arena
+                    .get(node)
+                    .and_then(|n| n.items.get(item).map(|it| (n.path.join(&it.name), it.is_dir))),
+                Action::NodeBody { node } => {
+                    arena.get(node).map(|n| (n.path.clone(), n.file.is_none()))
                 }
+                _ => None,
+            });
+            if let Some((path, is_dir)) = target {
+                self.context_menu = Some(ContextMenu { pos: cursor, path, is_dir });
+                dirty = true;
             }
         }
 
@@ -716,11 +718,16 @@ pub fn build_frame(
     // The current canvas root's path is the URL bar's default when nothing is
     // selected (there is always a node open).
     let root_path = arena.get(root).map(|n| n.path.clone());
-    // Background grid first, then connectors, so every node box paints over
-    // both — grid and lines pass *under* the nodes.
+    // The scene (canvas) holds only the background — the grid and the connector
+    // wires — so it can be blurred and sampled *behind* each node. Nodes and
+    // everything above them render in the overlay, over the composited scene.
     draw_grid(canvas, view);
     draw_connectors(arena, root, canvas, view, cap, &path);
-    draw_entries(ui, arena, root, ts, canvas, view, spin_angle, &path, &mut out);
+
+    // Composite the background, then draw the nodes on top; each node frosts the
+    // lines behind it by sampling the blurred scene.
+    overlay.image_slot(Rect::from_xywh(0.0, 0.0, window.x, window.y), TexSlot::Scene);
+    draw_entries(ui, arena, root, ts, overlay, view, spin_angle, &path, &mut out);
     // The rubber-band draws on top of the nodes, in screen px (like the grid).
     if let DragState::Marquee { origin } = ui.drag {
         let cur = ui.last_pointer;
@@ -728,8 +735,8 @@ pub fn build_frame(
             min: Point::new(origin.x.min(cur.x), origin.y.min(cur.y)),
             max: Point::new(origin.x.max(cur.x), origin.y.max(cur.y)),
         };
-        canvas.rect(band, COLOR_MARQUEE_FILL, 0.0);
-        canvas.rect_stroke(band, COLOR_MULTISELECT, 0.0, 1.0);
+        overlay.rect(band, COLOR_MARQUEE_FILL, 0.0);
+        overlay.rect_stroke(band, COLOR_MULTISELECT, 0.0, 1.0);
     }
     draw_navigation(ui, ts, overlay, window, caret_visible, root_path.as_deref());
     // The context menu draws last of all, on top of the toolbar.
@@ -754,14 +761,15 @@ fn draw_context_menu(ui: &mut Ui, ts: &mut TextSystem, list: &mut DrawList, wind
         ui.menu_rect = Rect::ZERO;
         return;
     };
+    let items = menu_items_for(menu.is_dir);
     let lh = ts.line_height();
     let item_h = lh + 2.0 * MENU_ITEM_PAD_Y;
     let mut text_w = 0.0f32;
-    for (_, label) in MENU_ITEMS {
+    for (_, label) in &items {
         text_w = text_w.max(ts.measure(label).x);
     }
     let w = text_w + 2.0 * MENU_ITEM_PAD_X;
-    let h = item_h * MENU_ITEMS.len() as f32 + 2.0 * MENU_PAD_Y;
+    let h = item_h * items.len() as f32 + 2.0 * MENU_PAD_Y;
     // Anchor at the cursor, clamped on-screen (and below the toolbar).
     let x = menu.pos.x.min(window.x - w - 4.0).max(4.0);
     let y = menu.pos.y.min(window.y - h - 4.0).max(TOOLBAR_H + 4.0);
@@ -797,7 +805,7 @@ fn draw_context_menu(ui: &mut Ui, ts: &mut TextSystem, list: &mut DrawList, wind
     // A full-menu hitbox swallows clicks on padding (pushed before the items so
     // they still win the reverse hit-test).
     ui.hitboxes.push(Hitbox { area: rect, action: Action::None, drag: DragKind::None });
-    for (i, (item, label)) in MENU_ITEMS.iter().enumerate() {
+    for (i, (item, label)) in items.iter().enumerate() {
         let iy = y + MENU_PAD_Y + i as f32 * item_h;
         let irow = Rect::from_xywh(x + 4.0, iy, w - 8.0, item_h);
         let action = Action::Menu(*item);
@@ -1047,6 +1055,22 @@ fn fit_rect(region: Rect, aspect: f32) -> Rect {
     Rect { min: Point::new(cx - w * 0.5, cy - h * 0.5), max: Point::new(cx + w * 0.5, cy + h * 0.5) }
 }
 
+/// Corner radius shared by node boxes and their frosted backdrops.
+const NODE_RADIUS: f32 = 5.0;
+
+/// Frost the background behind a node box: sample the blurred scene over the box
+/// (inset by the corner radius so the rectangular sample stays inside the
+/// rounded shape). Softens the grid and connector lines passing beneath it.
+fn draw_node_backdrop(list: &mut DrawList, view: View, screen_rect: Rect) {
+    let inset = inflate(screen_rect, -NODE_RADIUS);
+    if inset.max.x <= inset.min.x || inset.max.y <= inset.min.y {
+        return;
+    }
+    let w = view.window;
+    let uv = [inset.min.x / w.x, inset.min.y / w.y, inset.max.x / w.x, inset.max.y / w.y];
+    list.image_slot_uv(inset, TexSlot::Blur, uv);
+}
+
 /// Draw a node's bottom-right corner resize handle (two short edge lines) and
 /// push its press hitbox. The hit area is larger than the drawn glyph so the
 /// corner is easy to grab. Applies to every node — directory or file.
@@ -1135,6 +1159,7 @@ fn draw_entries(
     if let Some(fv) = file_view {
         if visible.intersects(node_rect) {
             let screen = view.w2s_rect(node_rect);
+            draw_node_backdrop(list, view, screen);
             list.rect(screen, COLOR_BOX_FILL, 5.0);
             let info_h = file_info_height(ts);
             let info_top = (node_rect.max.y - info_h).max(node_rect.min.y + HEADER_H);
@@ -1178,6 +1203,7 @@ fn draw_entries(
 
     if visible.intersects(node_rect) {
         let screen_rect = view.w2s_rect(node_rect);
+        draw_node_backdrop(list, view, screen_rect);
         list.rect(screen_rect, COLOR_BOX_FILL, 5.0);
         let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
         list.rect_stroke(screen_rect, border, 5.0, 3.0);
@@ -1312,9 +1338,9 @@ fn draw_navigation(
     caret_visible: bool,
     active_path: Option<&Path>,
 ) {
-    // Composite the offscreen canvas, then the blurred band under the bar. The
-    // blur now covers the whole scene, so sample just its top strip here.
-    list.image_slot(Rect::from_xywh(0.0, 0.0, window.x, window.y), TexSlot::Scene);
+    // The scene composite happens in build_frame (before the nodes). Here we
+    // just lay the blurred band under the bar; the blur covers the whole scene,
+    // so sample its top strip.
     let band = Rect::from_xywh(0.0, 0.0, window.x, TOOLBAR_H);
     list.image_slot_uv(band, TexSlot::Blur, [0.0, 0.0, 1.0, (TOOLBAR_H / window.y).clamp(0.0, 1.0)]);
     // Lighter tint than the C 0.9 so the frosted backdrop reads through.

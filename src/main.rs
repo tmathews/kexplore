@@ -422,19 +422,17 @@ fn main() {
                 if let Some(menu) = ui.context_menu.take() {
                     match item {
                         ui::MenuItem::Open => {
-                            // Files open in their handler (double-click), dirs
-                            // open/focus their node (single-click).
-                            handle_action(
-                                Action::Row { node: menu.node, item: menu.item },
-                                !menu.is_dir,
-                                &mut arena,
-                                &mut ui,
-                                &ts,
-                                &tasks,
-                                &file_handlers,
-                                &mut children,
-                                window,
-                            );
+                            // Files only: launch the configured handler.
+                            match handlers::find_handler(&file_handlers, &menu.path) {
+                                Some(h) => {
+                                    if let Err(e) =
+                                        handlers::spawn_handler(h, &menu.path, &mut children)
+                                    {
+                                        eprintln!("handler failed for {}: {e}", menu.path.display());
+                                    }
+                                }
+                                None => eprintln!("no handler for {}", menu.path.display()),
+                            }
                         }
                         ui::MenuItem::OpenTerminal => {
                             let dir = if menu.path.is_dir() {
