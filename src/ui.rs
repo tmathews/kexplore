@@ -83,6 +83,19 @@ pub enum DragState {
     Resize(NodeId),
 }
 
+/// What an in-progress touchpad 2-finger scroll gesture is doing. Locked at
+/// the start of the gesture so panning across a scrollable node keeps panning.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScrollLock {
+    None,
+    Pan,
+    Node(NodeId),
+}
+
+/// A finger-scroll gap longer than this (ms) starts a fresh gesture, so the
+/// target is re-evaluated only after the fingers lift.
+const SCROLL_GESTURE_GAP_MS: u128 = 150;
+
 pub struct Ui {
     pub camera: Point, // world point shown at the content origin (screen 0,0)
     pub camera_target: Point,
@@ -109,6 +122,10 @@ pub struct Ui {
     pub hover: Option<Action>,
     /// Previous click for double-click detection.
     last_click: Option<(Action, std::time::Instant)>,
+    /// Locked target of the current touchpad scroll gesture, and the time of
+    /// its last scroll event (a long gap ends the gesture).
+    scroll_lock: ScrollLock,
+    last_scroll: Option<std::time::Instant>,
 }
 
 /// The world↔screen transform for canvas content. Screen/logical px; the
@@ -167,6 +184,8 @@ impl Ui {
             last_pointer: Point::ZERO,
             hover: None,
             last_click: None,
+            scroll_lock: ScrollLock::None,
+            last_scroll: None,
         }
     }
 
@@ -296,36 +315,60 @@ impl Ui {
             dirty = true;
         }
 
-        // Scroll. Over an overflowing node, vertical scroll scrolls it.
-        // Otherwise a touchpad 2-finger swipe pans the canvas, while a mouse
-        // wheel zooms about the cursor.
+        // Scroll. A mouse wheel scrolls an overflowing node under the cursor,
+        // otherwise it zooms. A touchpad 2-finger scroll is one continuous
+        // gesture whose target — pan the canvas, or scroll a node — is locked
+        // at the start, so panning across a scrollable node keeps panning; you
+        // only scroll a node when the gesture *begins* on it.
         let dx = pointer.scroll_dx as f32;
         let dy = pointer.scroll_dy as f32;
         if dx != 0.0 || dy != 0.0 {
-            let node_scrolled = dy != 0.0
-                && hit
-                    .and_then(|h| h.drag.node())
-                    .and_then(|id| {
-                        arena.get_mut(id).and_then(|node| {
-                            let max_scroll = (node.content_h - node.rect.height()).max(0.0);
-                            (max_scroll > 0.0).then(|| {
-                                let step = if pointer.scroll_finger { 1.0 } else { 3.0 };
-                                node.scroll = (node.scroll + dy * step).clamp(0.0, max_scroll);
-                            })
-                        })
-                    })
-                    .is_some();
-            if node_scrolled {
-                dirty = true;
-            } else if pointer.scroll_finger {
-                // 2-finger pan: drag the canvas with the fingers (grab-style,
-                // like the middle-drag pan), world delta = scroll / zoom.
-                self.camera = self.camera.sub(Point::new(dx, dy).scale(1.0 / self.zoom));
-                self.refocus = false;
+            if pointer.scroll_finger {
+                let now = std::time::Instant::now();
+                let new_gesture = self.scroll_lock == ScrollLock::None
+                    || self.last_scroll.map_or(true, |t| {
+                        now.duration_since(t).as_millis() > SCROLL_GESTURE_GAP_MS
+                    });
+                if new_gesture {
+                    let on_scrollable = hit.and_then(|h| h.drag.node()).filter(|id| {
+                        arena.get(*id).is_some_and(|n| n.content_h - n.rect.height() > 0.5)
+                    });
+                    self.scroll_lock = match on_scrollable {
+                        Some(id) => ScrollLock::Node(id),
+                        None => ScrollLock::Pan,
+                    };
+                }
+                self.last_scroll = Some(now);
+                match self.scroll_lock {
+                    ScrollLock::Node(id) => {
+                        if let Some(node) = arena.get_mut(id) {
+                            let max = (node.content_h - node.rect.height()).max(0.0);
+                            node.scroll = (node.scroll + dy).clamp(0.0, max);
+                        }
+                    }
+                    _ => {
+                        // Pan: drag the canvas with the fingers (grab-style).
+                        self.camera = self.camera.sub(Point::new(dx, dy).scale(1.0 / self.zoom));
+                        self.refocus = false;
+                    }
+                }
                 dirty = true;
             } else {
-                // One wheel notch ~= 15 logical px; zoom in on scroll-up.
-                self.zoom_at(cursor, -dy / 15.0);
+                let node_scrolled = dy != 0.0
+                    && hit
+                        .and_then(|h| h.drag.node())
+                        .and_then(|id| {
+                            arena.get_mut(id).and_then(|node| {
+                                let max = (node.content_h - node.rect.height()).max(0.0);
+                                (max > 0.0)
+                                    .then(|| node.scroll = (node.scroll + dy * 3.0).clamp(0.0, max))
+                            })
+                        })
+                        .is_some();
+                if !node_scrolled {
+                    // One wheel notch ~= 15 logical px; zoom in on scroll-up.
+                    self.zoom_at(cursor, -dy / 15.0);
+                }
                 dirty = true;
             }
         }
