@@ -33,9 +33,10 @@ pub enum Icon {
     Folder,
     File,
     Star,
+    Pin,
 }
 
-const ICON_PNGS: [(&[u8], Icon); 10] = [
+const ICON_PNGS: [(&[u8], Icon); 11] = [
     (include_bytes!("../assets/icons/home.png"), Icon::Home),
     (include_bytes!("../assets/icons/close.png"), Icon::Close),
     (include_bytes!("../assets/icons/selection.png"), Icon::Selection),
@@ -46,6 +47,7 @@ const ICON_PNGS: [(&[u8], Icon); 10] = [
     (include_bytes!("../assets/icons/folder.png"), Icon::Folder),
     (include_bytes!("../assets/icons/file.png"), Icon::File),
     (include_bytes!("../assets/icons/star.png"), Icon::Star),
+    (include_bytes!("../assets/icons/pin.png"), Icon::Pin),
 ];
 
 #[derive(Clone, Copy)]

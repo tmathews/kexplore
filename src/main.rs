@@ -228,17 +228,20 @@ fn main() {
         while let Ok(result) = tasks.rx.try_recv() {
             match result {
                 TaskResult::PreviewDone { node, item, path, image } => {
-                    // Drop if the item vanished or its request was superseded.
-                    let still_loading = arena
+                    // Only attach if the item is still loading, has no child,
+                    // and is still the current selection (a transient preview
+                    // belongs to whatever is selected right now).
+                    let attach = arena
                         .get(node)
                         .and_then(|n| n.items.get(item))
-                        .is_some_and(|it| it.preview_loading && it.child.is_none());
+                        .is_some_and(|it| it.preview_loading && it.child.is_none())
+                        && ui.selection == Some((node, item));
                     if let Some(n) = arena.get_mut(node) {
                         if let Some(it) = n.items.get_mut(item) {
                             it.preview_loading = false;
                         }
                     }
-                    if let (true, Some(img)) = (still_loading, image) {
+                    if let (true, Some(img)) = (attach, image) {
                         match make_preview_texture(&gfx, &renderer, &img) {
                             Ok((tex, set)) => {
                                 extra_uploads.push(PendingUpload {
@@ -253,9 +256,10 @@ fn main() {
                                 let tex_id = ptex.alloc(tex, set);
                                 let (lw, lh) = platform.logical_size;
                                 let win = Point::new(lw as f32, lh as f32);
+                                // Auto-opened previews start transient (unpinned).
                                 spawn_preview_node(
                                     &mut arena, &mut ui, node, item, path, tex_id,
-                                    img.width, img.height, win,
+                                    img.width, img.height, false, win,
                                 );
                             }
                             Err(e) => eprintln!("preview texture failed: {e}"),
@@ -335,6 +339,22 @@ fn main() {
                         }
                         // Invalid path: stay in the editor so it can be fixed.
                         dirty = true;
+                    }
+                }
+            }
+        } else {
+            // Canvas keys: Space pins the selected item's transient preview.
+            for ev in &key_events {
+                if ev.keysym.raw() == ks::KEY_space {
+                    if let Some(child) = ui.selection.and_then(|(node, item)| {
+                        arena.get(node).and_then(|n| n.items.get(item)).and_then(|it| it.child)
+                    }) {
+                        if let Some(n) = arena.get_mut(child) {
+                            if let Some(pv) = &mut n.preview {
+                                pv.pinned = true;
+                                dirty = true;
+                            }
+                        }
                     }
                 }
             }
@@ -753,26 +773,47 @@ fn handle_action(
             let path = n.path.join(&it.name);
             ui.selected_path = Some(path.clone());
             let is_dir = it.is_dir;
-            // Double-click opens: directories scan into a node, previewable
-            // files decode into an image node. A single click only selects.
-            let can_scan = double && is_dir && it.child.is_none() && !it.scanning;
-            let can_preview = double
-                && !is_dir
-                && it.child.is_none()
-                && !it.preview_loading
-                && preview::previewable(&path);
-            // Marking the in-flight flag before spawning both shows the
-            // spinner and dedups double-clicks (the C version raced here).
-            if can_scan {
-                if let Some(n) = arena.get_mut(node) {
-                    n.items[item].scanning = true;
+            let child = it.child;
+            let scanning = it.scanning;
+            let preview_loading = it.preview_loading;
+
+            if double {
+                // Double-click opens: directories scan into a node, files open
+                // with their configured handler (an external app).
+                if is_dir {
+                    if child.is_none() && !scanning {
+                        if let Some(n) = arena.get_mut(node) {
+                            n.items[item].scanning = true;
+                        }
+                        tasks.spawn_scan(node, item, path);
+                    }
+                } else {
+                    match handlers::find_handler(file_handlers, &path) {
+                        Some(h) => {
+                            if let Err(e) = handlers::spawn_handler(h, &path, children) {
+                                eprintln!("handler failed for {}: {e}", path.display());
+                            }
+                        }
+                        None => eprintln!("no handler for {}", path.display()),
+                    }
                 }
-                tasks.spawn_scan(node, item, path);
-            } else if can_preview {
-                if let Some(n) = arena.get_mut(node) {
-                    n.items[item].preview_loading = true;
+                return;
+            }
+
+            // Single click auto-opens a transient (unpinned) preview of a
+            // previewable file. Selecting anything else dismisses the current
+            // transient preview; an item that already has its own preview
+            // keeps it.
+            let has_preview =
+                child.map_or(false, |c| arena.get(c).is_some_and(|n| n.preview.is_some()));
+            if !has_preview {
+                close_unpinned_previews(arena);
+                if !is_dir && preview::previewable(&path) && !preview_loading {
+                    if let Some(n) = arena.get_mut(node) {
+                        n.items[item].preview_loading = true;
+                    }
+                    tasks.spawn_preview(node, item, path);
                 }
-                tasks.spawn_preview(node, item, path);
             }
         }
         Action::CloseNode { node } => {
@@ -789,6 +830,13 @@ fn handle_action(
                 let p = n.path.clone();
                 if !ui.favorites.remove(&p) {
                     ui.favorites.insert(p);
+                }
+            }
+        }
+        Action::PinPreview { node } => {
+            if let Some(n) = arena.get_mut(node) {
+                if let Some(pv) = &mut n.preview {
+                    pv.pinned = true;
                 }
             }
         }
@@ -858,6 +906,19 @@ fn handle_action(
 /// to the image aspect (capped to the safe area), placed to the right of the
 /// row like a directory child, and collision-resolved so it doesn't land on
 /// an existing node.
+/// Close every unpinned (transient) preview node. There is at most one at a
+/// time; it is dismissed whenever the selection moves.
+fn close_unpinned_previews(arena: &mut NodeArena) {
+    let ids: Vec<NodeId> = arena
+        .iter()
+        .filter(|(_, n)| n.preview.is_some_and(|p| !p.pinned))
+        .map(|(id, _)| id)
+        .collect();
+    for id in ids {
+        arena.close_recursive(id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_preview_node(
     arena: &mut NodeArena,
@@ -868,6 +929,7 @@ fn spawn_preview_node(
     tex: u32,
     img_w: u32,
     img_h: u32,
+    pinned: bool,
     window: Point,
 ) {
     let Some(p) = arena.get(node) else { return };
@@ -883,7 +945,8 @@ fn spawn_preview_node(
         w = ((box_h - model::HEADER_H).max(1.0) * aspect).min(cap.x);
     }
     let rect = geom::Rect::from_xywh(origin.x, origin.y, w, box_h);
-    let child_id = arena.insert(model::preview_node(path, (node, item), tex, img_w, img_h, rect));
+    let child_id =
+        arena.insert(model::preview_node(path, (node, item), tex, img_w, img_h, rect, pinned));
     if let Some(n) = arena.get_mut(node) {
         n.items[item].child = Some(child_id);
     }

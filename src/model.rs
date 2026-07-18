@@ -47,6 +47,9 @@ pub struct PreviewData {
     /// Intrinsic image size in pixels (for aspect-locked resize).
     pub img_w: u32,
     pub img_h: u32,
+    /// Unpinned previews are transient (auto-opened on select, closed when the
+    /// selection moves); pinning keeps the node open like a directory node.
+    pub pinned: bool,
 }
 
 pub struct Item {
@@ -200,6 +203,7 @@ pub fn node_from_items(path: PathBuf, data: Vec<ItemData>) -> Node {
 /// Build an image-preview node (no rows) sized to `rect`. Attached to a file
 /// item via `parent`; draws texture `tex` and resizes aspect-locked from the
 /// intrinsic `img_w`/`img_h`.
+#[allow(clippy::too_many_arguments)]
 pub fn preview_node(
     path: PathBuf,
     parent: (NodeId, usize),
@@ -207,6 +211,7 @@ pub fn preview_node(
     img_w: u32,
     img_h: u32,
     rect: Rect,
+    pinned: bool,
 ) -> Node {
     Node {
         path,
@@ -217,7 +222,7 @@ pub fn preview_node(
         content_h: rect.height(),
         scroll: 0.0,
         anim_to: None,
-        preview: Some(PreviewData { tex, img_w, img_h }),
+        preview: Some(PreviewData { tex, img_w, img_h, pinned }),
     }
 }
 

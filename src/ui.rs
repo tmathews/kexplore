@@ -41,6 +41,8 @@ pub enum Action {
     CloseNode { node: NodeId },
     /// Toggle the node's path in the favorites set (header star button).
     ToggleFavorite { node: NodeId },
+    /// Pin a transient preview node so it stays open (header pin button).
+    PinPreview { node: NodeId },
     /// Press target for a preview node's corner resize handle.
     ResizePreview { node: NodeId },
 }
@@ -512,7 +514,7 @@ fn draw_header(
     id: NodeId,
     node_rect: Rect,
     type_icon: Icon,
-    is_root: bool,
+    primary: Option<(Icon, Action)>,
     favorited: bool,
 ) {
     let hdr = Rect { min: node_rect.min, max: Point::new(node_rect.max.x, node_rect.min.y + HEADER_H) };
@@ -525,17 +527,16 @@ fn draw_header(
     let iy = node_rect.min.y + (HEADER_H - HEADER_ICON) * 0.5;
     let ir = view.w2s_rect(Rect::from_xywh(node_rect.min.x + HEADER_PAD, iy, HEADER_ICON, HEADER_ICON));
     list.glyph_quad(ir, ts.icon_uv(type_icon), Rgba::new(1.0, 1.0, 1.0, 0.85), 0.0);
-    // Action buttons, right to left: close (non-root), then favorite.
+    // Action buttons, right to left: the primary button (close/pin), then star.
     let by = node_rect.min.y + (HEADER_H - HEADER_BTN) * 0.5;
     let mut bx = node_rect.max.x - HEADER_PAD - HEADER_BTN;
-    if !is_root {
-        let cr = view.w2s_rect(Rect::from_xywh(bx, by, HEADER_BTN, HEADER_BTN));
-        let action = Action::CloseNode { node: id };
+    if let Some((icon, action)) = primary {
+        let r = view.w2s_rect(Rect::from_xywh(bx, by, HEADER_BTN, HEADER_BTN));
         if ui.hover == Some(action) {
-            list.rect(inflate(cr, 2.0), HOVER_BUTTON_BG, 4.0);
+            list.rect(inflate(r, 2.0), HOVER_BUTTON_BG, 4.0);
         }
-        list.glyph_quad(cr, ts.icon_uv(Icon::Close), Rgba::WHITE, 0.0);
-        ui.hitboxes.push(Hitbox { area: cr, action, drag: DragKind::Node(id) });
+        list.glyph_quad(r, ts.icon_uv(icon), Rgba::WHITE, 0.0);
+        ui.hitboxes.push(Hitbox { area: r, action, drag: DragKind::Node(id) });
         bx -= HEADER_BTN + HEADER_BTN_GAP;
     }
     let fr = view.w2s_rect(Rect::from_xywh(bx, by, HEADER_BTN, HEADER_BTN));
@@ -676,22 +677,22 @@ fn draw_entries(
 
     // Re-clamp the box and scroll every frame so window resizes keep the
     // 90% rule without a relayout. Preview boxes are user-sized and skip this.
-    let (node_rect, scroll, content_h, is_root, preview_tex, favorited) = {
+    let (node_rect, scroll, content_h, is_root, preview_info, favorited) = {
         let Some(node) = arena.get_mut(id) else { return };
-        let preview_tex = node.preview.map(|p| p.tex);
-        if preview_tex.is_none() {
+        let preview_info = node.preview.map(|p| (p.tex, p.pinned));
+        if preview_info.is_none() {
             let box_w = node.content_w.min(cap.x);
             let box_h = node.content_h.min(cap.y);
             node.rect.max = Point::new(node.rect.min.x + box_w, node.rect.min.y + box_h);
             node.scroll = node.scroll.clamp(0.0, (node.content_h - box_h).max(0.0));
         }
         let favorited = ui.favorites.contains(&node.path);
-        (node.rect, node.scroll, node.content_h, node.parent.is_none(), preview_tex, favorited)
+        (node.rect, node.scroll, node.content_h, node.parent.is_none(), preview_info, favorited)
     };
 
     // Preview node: header bar, the image below it, and a corner resize
     // handle, then stop — no rows, no scroll, no children.
-    if let Some(tex) = preview_tex {
+    if let Some((tex, pinned)) = preview_info {
         if visible.intersects(node_rect) {
             let screen = view.w2s_rect(node_rect);
             list.rect(screen, COLOR_BOX_FILL, 5.0);
@@ -704,7 +705,14 @@ fn draw_entries(
             let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
             list.rect_stroke(screen, border, 5.0, 3.0);
             ui.hitboxes.push(Hitbox { area: screen, action: Action::NodeBody, drag: DragKind::Node(id) });
-            draw_header(ui, ts, list, view, id, node_rect, Icon::File, is_root, favorited);
+            // Unpinned previews show a pin button (they are transient); pinned
+            // ones show a close button.
+            let primary = if pinned {
+                (Icon::Close, Action::CloseNode { node: id })
+            } else {
+                (Icon::Pin, Action::PinPreview { node: id })
+            };
+            draw_header(ui, ts, list, view, id, node_rect, Icon::File, Some(primary), favorited);
             // Corner resize handle (bottom-right): two short edge lines.
             let hr = view.w2s_rect(Rect::from_xywh(
                 node_rect.max.x - PREVIEW_HANDLE,
@@ -727,7 +735,8 @@ fn draw_entries(
         let border = if path.contains(&id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
         list.rect_stroke(screen_rect, border, 5.0, 3.0);
         ui.hitboxes.push(Hitbox { area: screen_rect, action: Action::NodeBody, drag: DragKind::Node(id) });
-        draw_header(ui, ts, list, view, id, node_rect, Icon::Folder, is_root, favorited);
+        let primary = (!is_root).then_some((Icon::Close, Action::CloseNode { node: id }));
+        draw_header(ui, ts, list, view, id, node_rect, Icon::Folder, primary, favorited);
     }
 
     // Rows draw shifted by the scroll offset and clip to below the header.
