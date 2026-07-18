@@ -377,6 +377,14 @@ fn main() {
                 // it was closed) and jump the camera there.
                 navigate_to(&mut arena, &mut ui, &mut ts, root, &home, window);
                 dirty = true;
+            } else if matches!(action, Action::GoUp) {
+                // Up button: navigate to the parent of the current location.
+                if let Some(parent) =
+                    ui.selected_path.as_deref().and_then(Path::parent).map(Path::to_path_buf)
+                {
+                    navigate_to(&mut arena, &mut ui, &mut ts, root, &parent, window);
+                    dirty = true;
+                }
             } else {
                 handle_action(
                     action,
@@ -797,32 +805,6 @@ fn handle_action(
                 }
             }
         }
-        Action::FocusParentItem => {
-            // Focus the item row in the parent that owns the selection's
-            // node (the C version's intent; its math added the wrong base).
-            if let Some((node, _)) = ui.selection {
-                let Some(n) = arena.get(node) else { return };
-                if let Some((pid, pidx)) = n.parent {
-                    if let Some(p) = arena.get(pid) {
-                        if let Some(pit) = p.items.get(pidx) {
-                            let r = pit
-                                .rect
-                                .offset(p.rect.min)
-                                .offset(Point::new(0.0, -p.scroll));
-                            ui.focus_to_rect(r, window);
-                        }
-                    }
-                }
-            }
-        }
-        Action::FocusNodeTop => {
-            if let Some((node, _)) = ui.selection {
-                if let Some(n) = arena.get(node) {
-                    let r = n.rect;
-                    ui.focus_to_rect(r, window);
-                }
-            }
-        }
         Action::CopyPath => {
             // Arg-vector spawn: paths with spaces survive (the C
             // string_concat version broke them).
@@ -861,12 +843,13 @@ fn handle_action(
                 None => eprintln!("no handler for {}", path.display()),
             }
         }
-        // UrlBar and FocusHome are handled inline in the main loop (they need
-        // text/caret state or navigate_to); ResizePreview is press-driven.
+        // UrlBar, FocusHome and GoUp are handled inline in the main loop (they
+        // need text/caret state or navigate_to); ResizePreview is press-driven.
         Action::NodeBody
         | Action::None
         | Action::UrlBar
         | Action::FocusHome
+        | Action::GoUp
         | Action::ResizePreview { .. } => {}
     }
 }

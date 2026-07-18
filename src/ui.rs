@@ -31,8 +31,8 @@ pub enum Action {
     UrlBar,
     FocusHome,
     FocusSelection,
-    FocusParentItem,
-    FocusNodeTop,
+    /// Go up one level: navigate to the parent of the current location.
+    GoUp,
     CopyPath,
     OpenTerminal,
     Row { node: NodeId, item: usize },
@@ -878,8 +878,7 @@ fn draw_navigation(
     let buttons = [
         (Icon::Home, Action::FocusHome),
         (Icon::Selection, Action::FocusSelection),
-        (Icon::Parent, Action::FocusParentItem),
-        (Icon::Top, Action::FocusNodeTop),
+        (Icon::Parent, Action::GoUp),
         (Icon::Copy, Action::CopyPath),
         (Icon::Terminal, Action::OpenTerminal),
     ];
