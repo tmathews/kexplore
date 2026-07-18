@@ -586,8 +586,12 @@ const DOUBLE_CLICK_MS: u128 = 400;
 
 /// Smallest width (logical px) an image-preview node can be resized to.
 const PREVIEW_MIN_W: f32 = 100.0;
-/// Size (logical px) of the corner resize handle on a preview node.
+/// Drawn size (logical px) of the corner resize handle glyph.
 const PREVIEW_HANDLE: f32 = 16.0;
+/// The resize grab zone is larger than the drawn glyph so the corner is easy to
+/// hit: it reaches this far in from the corner and a little past it outward.
+const RESIZE_GRAB_IN: f32 = 28.0;
+const RESIZE_GRAB_OUT: f32 = 7.0;
 
 fn inflate(r: Rect, by: f32) -> Rect {
     Rect { min: Point::new(r.min.x - by, r.min.y - by), max: Point::new(r.max.x + by, r.max.y + by) }
@@ -903,7 +907,8 @@ fn fit_rect(region: Rect, aspect: f32) -> Rect {
 }
 
 /// Draw a node's bottom-right corner resize handle (two short edge lines) and
-/// push its press hitbox. Applies to every node — directory or file.
+/// push its press hitbox. The hit area is larger than the drawn glyph so the
+/// corner is easy to grab. Applies to every node — directory or file.
 fn draw_resize_handle(ui: &mut Ui, list: &mut DrawList, view: View, node_rect: Rect, id: NodeId) {
     let hr = view.w2s_rect(Rect::from_xywh(
         node_rect.max.x - PREVIEW_HANDLE,
@@ -915,7 +920,12 @@ fn draw_resize_handle(ui: &mut Ui, list: &mut DrawList, view: View, node_rect: R
     let hc = if ui.hover == Some(raction) { Rgba::WHITE } else { Rgba::new(1.0, 1.0, 1.0, 0.6) };
     list.line(Point::new(hr.min.x, hr.max.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
     list.line(Point::new(hr.max.x, hr.min.y), Point::new(hr.max.x, hr.max.y), 2.0, hc);
-    ui.hitboxes.push(Hitbox { area: hr, action: raction, drag: DragKind::Resize(id) });
+    // Grab zone: reaches further in from the corner and a little past it.
+    let grab = view.w2s_rect(Rect {
+        min: Point::new(node_rect.max.x - RESIZE_GRAB_IN, node_rect.max.y - RESIZE_GRAB_IN),
+        max: Point::new(node_rect.max.x + RESIZE_GRAB_OUT, node_rect.max.y + RESIZE_GRAB_OUT),
+    });
+    ui.hitboxes.push(Hitbox { area: grab, action: raction, drag: DragKind::Resize(id) });
 }
 
 /// Human-readable byte size, e.g. `1.2 MiB` (exact `B` under 1 KiB).
