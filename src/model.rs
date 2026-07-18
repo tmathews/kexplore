@@ -180,6 +180,12 @@ pub fn node_from_items(path: PathBuf, data: Vec<ItemData>) -> Node {
     }
 }
 
+/// Logical size of the file-type icon at the start of each row, and the gap
+/// between it and the row text. Used by `calc_size` (width reservation) and
+/// `ui::draw_entries` (icon + text placement); keep them in step.
+pub const ROW_ICON: f32 = 15.0;
+pub const ROW_ICON_GAP: f32 = 5.0;
+
 /// Port of node_calc_size: stack rows vertically with 5px padding, size the
 /// box to the widest row, and position it to the right of the parent item.
 /// The displayed box is capped to `max_size` (90% of the safe viewing area);
@@ -188,11 +194,14 @@ pub fn calc_size(arena: &mut NodeArena, id: NodeId, ts: &mut TextSystem, max_siz
     const PADDING: f32 = 5.0;
     let Some(node) = arena.get(id) else { return };
     let lh = ts.line_height();
+    // Room at the start of each row for the file-type icon (see ROW_ICON /
+    // ROW_ICON_GAP in ui.rs; kept in sync here so the box is wide enough).
+    let icon_advance = ROW_ICON + ROW_ICON_GAP;
     let mut oy = PADDING;
     let mut max_w = 0.0f32;
     let mut rects = Vec::with_capacity(node.items.len());
     for item in &node.items {
-        let w = ts.measure(&item.display).x;
+        let w = icon_advance + ts.measure(&item.display).x;
         rects.push(Rect { min: Point::new(PADDING, oy), max: Point::new(PADDING + w, oy + lh) });
         oy += lh;
         max_w = max_w.max(w);

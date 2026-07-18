@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use crate::geom::{Point, Rect};
 use crate::gfx::renderer2d::{DrawList, Rgba, TexSlot};
-use crate::model::{NodeArena, NodeId};
+use crate::model::{NodeArena, NodeId, ROW_ICON, ROW_ICON_GAP};
 use crate::platform::wayland::PointerState;
 use crate::text::{Icon, TextSystem};
 use crate::textfield::TextField;
@@ -286,6 +286,9 @@ const COLOR_ROW_SELECTED: Rgba = Rgba([255, 0, 0, 255]);
 const COLOR_ROW_OPEN: Rgba = Rgba([0, 255, 0, 255]);
 const HOVER_ROW_BG: Rgba = Rgba([255, 255, 255, 26]); // white 0.10
 const HOVER_BUTTON_BG: Rgba = Rgba([255, 255, 255, 38]); // white 0.15
+/// Zebra striping on alternate rows — fainter than the hover highlight so it
+/// never competes with it.
+const ALT_ROW_BG: Rgba = Rgba([255, 255, 255, 10]); // white ~0.04
 /// Border for nodes on the chain from root to the current selection.
 const COLOR_PATH_BORDER: Rgba = Rgba([255, 191, 64, 255]);
 
@@ -488,6 +491,12 @@ fn draw_entries(
 
         if in_view {
             let row_action = Action::Row { node: id, item: i };
+            // Zebra striping on odd rows (#15), under the hover highlight.
+            if i % 2 == 1 {
+                if let Some(bg) = band.intersect(content_clip) {
+                    list.rect(bg.offset(off), ALT_ROW_BG, 0.0);
+                }
+            }
             if ui.hover == Some(row_action) {
                 if let Some(bg) = band.intersect(content_clip) {
                     list.rect(bg.offset(off), HOVER_ROW_BG, 3.0);
@@ -500,7 +509,17 @@ fn draw_entries(
             } else {
                 Rgba::WHITE
             };
-            ts.draw_clipped(list, screen_rect.min, &display, color, content_clip.offset(off));
+            // File-type icon (#14): folder for directories, page for files.
+            // Only drawn when the row sits fully inside the box so it never
+            // pokes past a scrolled edge (text uses draw_clipped for that).
+            if rect.min.y >= content_clip.min.y - 0.5 && rect.max.y <= content_clip.max.y + 0.5 {
+                let icon = if is_dir { Icon::Folder } else { Icon::File };
+                let iy = screen_rect.min.y + (rect.height() - ROW_ICON) * 0.5;
+                let ir = Rect::from_xywh(screen_rect.min.x, iy, ROW_ICON, ROW_ICON);
+                list.glyph_quad(ir, ts.icon_uv(icon), color, 0.0);
+            }
+            let text_origin = Point::new(screen_rect.min.x + ROW_ICON + ROW_ICON_GAP, screen_rect.min.y);
+            ts.draw_clipped(list, text_origin, &display, color, content_clip.offset(off));
             if let Some(hb) = band.offset(off).intersect(content_clip.offset(off)) {
                 ui.hitboxes.push(Hitbox { area: hb, action: row_action, drag: Some(id) });
             }
