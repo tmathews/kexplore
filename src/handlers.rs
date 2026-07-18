@@ -34,9 +34,9 @@ pub fn read_handlers(path: &Path) -> Vec<Handler> {
             .map(|e| e.trim().to_ascii_lowercase())
             .filter(|e| !e.is_empty())
             .collect();
-        let command: Vec<String> = command
-            .split_whitespace()
-            .map(|tok| expand_tilde(tok, home.as_deref()))
+        let command: Vec<String> = tokenize(command)
+            .into_iter()
+            .map(|tok| expand_tilde(&tok, home.as_deref()))
             .collect();
         if exts.is_empty() || command.is_empty() {
             continue;
@@ -44,6 +44,42 @@ pub fn read_handlers(path: &Path) -> Vec<Handler> {
         handlers.push(Handler { exts, command });
     }
     handlers
+}
+
+/// Split a command template into argv tokens, honouring single/double quotes:
+/// quotes group whitespace into one token and are stripped from the result, so
+/// `imv "{FILE}"` yields `["imv", "{FILE}"]` (the C app relied on wordexp for
+/// this). No escapes or nested quoting — the config format is intentionally
+/// tiny.
+fn tokenize(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut has_token = false;
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                has_token = true;
+            }
+            None if c.is_whitespace() => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            None => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        tokens.push(cur);
+    }
+    tokens
 }
 
 fn expand_tilde(tok: &str, home: Option<&OsStr>) -> String {
@@ -110,4 +146,28 @@ pub fn spawn<S: AsRef<OsStr>>(
 /// Sweep exited children (the C app never waited -> zombies).
 pub fn reap(children: &mut Vec<Child>) {
     children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_strips_quotes_and_groups_spaces() {
+        assert_eq!(tokenize("imv \"{FILE}\""), vec!["imv", "{FILE}"]);
+        assert_eq!(tokenize("imv '{FILE}'"), vec!["imv", "{FILE}"]);
+        assert_eq!(tokenize("imv {FILE}"), vec!["imv", "{FILE}"]);
+        assert_eq!(tokenize("a \"b c\" d"), vec!["a", "b c", "d"]);
+        assert_eq!(tokenize("  trailing  "), vec!["trailing"]);
+    }
+
+    #[test]
+    fn quoted_placeholder_substitutes_without_literal_quotes() {
+        // The whole point of the bug fix: `imv "{FILE}"` must pass the bare
+        // path, not a path wrapped in quote characters.
+        let toks = tokenize("imv \"{FILE}\"");
+        let path = Path::new("/home/thomas/my pic.png");
+        let args: Vec<OsString> = toks.iter().map(|t| substitute(t, path)).collect();
+        assert_eq!(args, vec![OsString::from("imv"), OsString::from("/home/thomas/my pic.png")]);
+    }
 }
