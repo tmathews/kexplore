@@ -28,13 +28,57 @@ save="$3"
 path="$4"
 out="$5"
 
-kexplore="${KEXPLORE_BIN:-kexplore}"
+# Resolving the binary matters more than it looks: the portal launches this
+# from a systemd user service whose PATH is typically just /usr/local/bin and
+# /usr/bin, so a kexplore installed anywhere else is invisible here even though
+# it works fine in a login shell. Fall back to a build sitting next to this
+# script before giving up.
+if [ -n "${KEXPLORE_BIN:-}" ]; then
+    kexplore="$KEXPLORE_BIN"
+elif command -v kexplore >/dev/null 2>&1; then
+    kexplore=kexplore
+else
+    # Parameter expansion, not dirname: this branch is reached precisely when
+    # PATH is unhelpful, so it must not depend on finding coreutils.
+    case "$0" in
+        */*) here="${0%/*}" ;;
+        *) here="." ;;
+    esac
+    for candidate in \
+        "$here/../target/release/kexplore" \
+        "$here/../target/debug/kexplore"
+    do
+        if [ -x "$candidate" ]; then
+            kexplore="$candidate"
+            break
+        fi
+    done
+    if [ -z "${kexplore:-}" ]; then
+        echo "kexplore-wrapper: cannot find the kexplore binary." >&2
+        echo "  PATH=$PATH" >&2
+        echo "  Set KEXPLORE_BIN, or install kexplore into /usr/local/bin." >&2
+        exit 127
+    fi
+fi
 
 if [ "$save" = "1" ]; then
     if [ -n "$path" ]; then
-        # Split the recommended path into the name to prefill and the
-        # directory to land in.
-        set -- --save "$(basename -- "$path")" --start "$(dirname -- "$path")"
+        # Split the recommended path into the name to prefill and the directory
+        # to land in. Done with parameter expansion so the two edge cases
+        # basename/dirname handle -- a bare name, and a file directly under
+        # "/" -- stay correct without shelling out.
+        case "$path" in
+            */*)
+                name="${path##*/}"
+                dir="${path%/*}"
+                [ -n "$dir" ] || dir="/"
+                ;;
+            *)
+                name="$path"
+                dir="."
+                ;;
+        esac
+        set -- --save "$name" --start "$dir"
     else
         set -- --save
     fi

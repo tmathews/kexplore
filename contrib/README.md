@@ -30,8 +30,24 @@ yay -S xdg-desktop-portal-termfilechooser-git
 cmd=/path/to/kexplore/contrib/kexplore-termfilechooser-wrapper.sh
 ```
 
-The wrapper runs `kexplore` from `$PATH`. To use a build in place, set
-`KEXPLORE_BIN` (it is read by the wrapper), or install the binary.
+The wrapper finds the binary in this order:
+
+1. `$KEXPLORE_BIN`, if set.
+2. `kexplore` on `$PATH`.
+3. `../target/release/kexplore`, then `../target/debug/kexplore`, relative to
+   the wrapper itself.
+
+Step 3 exists because the portal launches the wrapper from a **systemd user
+service**, whose `PATH` is usually just `/usr/local/bin:/usr/bin` — so a
+kexplore installed anywhere else (`~/.local/bin`, a `bin` dir on your shell
+`PATH`) is invisible here even though it runs fine in a terminal. Check with:
+
+```sh
+systemctl --user show-environment | grep ^PATH=
+```
+
+If none of the three resolve, the wrapper exits 127 and prints the `PATH` it
+searched, rather than failing silently inside the portal.
 
 **3. Select the backend** — `~/.config/xdg-desktop-portal/portals.conf`:
 
