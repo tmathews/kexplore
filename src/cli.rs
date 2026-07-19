@@ -145,6 +145,41 @@ mod tests {
         assert_eq!(p.out, Some(PathBuf::from("/tmp/o")));
     }
 
+    /// The exact argument vectors produced by
+    /// contrib/kexplore-termfilechooser-wrapper.sh, so the portal contract
+    /// cannot drift away from the parser.
+    #[test]
+    fn parses_what_the_termfilechooser_wrapper_emits() {
+        let open = parse_ok(&["--pick-file", "--out", "/tmp/o"]);
+        assert!(!open.picker.as_ref().unwrap().multiple);
+
+        let multi = parse_ok(&["--pick-files", "--out", "/tmp/o"]);
+        assert!(multi.picker.as_ref().unwrap().multiple);
+
+        let dir = parse_ok(&["--pick-dir", "--out", "/tmp/o"]);
+        assert!(dir.picker.as_ref().unwrap().kind == PickKind::OpenDir);
+
+        let save = parse_ok(&[
+            "--save",
+            "page.html",
+            "--start",
+            "/home/u/Downloads",
+            "--out",
+            "/tmp/o",
+        ]);
+        let p = save.picker.expect("picker");
+        assert_eq!(p.save_name, "page.html");
+        assert_eq!(p.out, Some(PathBuf::from("/tmp/o")));
+        assert_eq!(save.start, Some(PathBuf::from("/home/u/Downloads")));
+
+        // The wrapper emits a bare `--save` when the caller suggested no path;
+        // the following flag must not be taken as the filename.
+        let bare = parse_ok(&["--save", "--out", "/tmp/o"]);
+        let p = bare.picker.expect("picker");
+        assert_eq!(p.save_name, "");
+        assert_eq!(p.out, Some(PathBuf::from("/tmp/o")));
+    }
+
     #[test]
     fn missing_values_and_unknown_flags_error() {
         assert!(parse(["--out".to_string()].into_iter()).is_err());
