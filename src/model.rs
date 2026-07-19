@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::geom::{Point, Rect};
 use crate::text::TextSystem;
+use crate::textfield::TextField;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId {
@@ -41,10 +42,56 @@ pub struct Node {
     /// True once the user has manually resized the box, which turns off the
     /// automatic content-fit clamp for directory nodes.
     pub user_sized: bool,
-    /// Some for file nodes: they represent a single file (metadata panel, plus
-    /// an image when the type can be displayed) instead of directory rows.
-    /// Directory nodes leave this None.
-    pub file: Option<FileView>,
+    /// What this node *is* — which decides how it lays out and draws.
+    pub body: NodeBody,
+}
+
+/// The kind of a node. Directory nodes render `items` as rows and fit their box
+/// to that content; file nodes render a metadata panel (plus an image once one
+/// is decoded); draft nodes are the unsaved "new file" box — a name being typed,
+/// anchored to a directory.
+pub enum NodeBody {
+    Dir,
+    File(FileView),
+    Draft(Draft),
+}
+
+/// A file that does not exist yet: the name being edited, and the directory it
+/// would land in. `dir` re-binds as the active route moves, so it is *not* a
+/// `Node::parent` link — no item row backs a draft.
+pub struct Draft {
+    pub dir: NodeId,
+    pub name: TextField,
+}
+
+impl NodeBody {
+    pub fn is_dir(&self) -> bool {
+        matches!(self, NodeBody::Dir)
+    }
+    pub fn file(&self) -> Option<&FileView> {
+        match self {
+            NodeBody::File(f) => Some(f),
+            _ => None,
+        }
+    }
+    pub fn file_mut(&mut self) -> Option<&mut FileView> {
+        match self {
+            NodeBody::File(f) => Some(f),
+            _ => None,
+        }
+    }
+    pub fn draft(&self) -> Option<&Draft> {
+        match self {
+            NodeBody::Draft(d) => Some(d),
+            _ => None,
+        }
+    }
+    pub fn draft_mut(&mut self) -> Option<&mut Draft> {
+        match self {
+            NodeBody::Draft(d) => Some(d),
+            _ => None,
+        }
+    }
 }
 
 /// A file node's contents: stat metadata, an optional decoded image, and the
@@ -307,7 +354,7 @@ pub fn node_from_items(path: PathBuf, data: Vec<ItemData>) -> Node {
         anim_to: None,
         pinned: false,
         user_sized: false,
-        file: None,
+        body: NodeBody::Dir,
     }
 }
 
@@ -332,7 +379,30 @@ pub fn file_node(
         anim_to: None,
         pinned,
         user_sized: false,
-        file: Some(FileView::new(meta, image)),
+        body: NodeBody::File(FileView::new(meta, image)),
+    }
+}
+
+/// Build a draft ("new file") node sized to `rect`, anchored to directory
+/// `dir`. It has no `parent` link and is born pinned: a draft is never a peek,
+/// so `prune_transients` must not collect it. `path` is the directory it
+/// currently targets; the filename lives in the `TextField`.
+pub fn draft_node(dir: NodeId, path: PathBuf, name: String, rect: Rect) -> Node {
+    let mut field = TextField::new();
+    let caret = name.len();
+    field.begin(name, caret);
+    Node {
+        path,
+        items: Vec::new(),
+        parent: None,
+        rect,
+        content_w: rect.width(),
+        content_h: rect.height(),
+        scroll: 0.0,
+        anim_to: None,
+        pinned: true,
+        user_sized: false,
+        body: NodeBody::Draft(Draft { dir, name: field }),
     }
 }
 

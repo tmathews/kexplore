@@ -82,6 +82,9 @@ pub struct PointerState {
     /// Net multiplicative zoom from a pinch gesture this iteration; 0.0 means
     /// no pinch (a real factor is >0, e.g. 1.05 to zoom in a little).
     pub pinch: f64,
+    /// Whether Ctrl is held, mirrored from the keyboard's modifier state so
+    /// click handling can tell a plain click from a toggle-select click.
+    pub ctrl: bool,
 }
 
 /// A resolved key press (or repeat) ready for the UI to consume.
@@ -654,6 +657,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Platform {
             } => {
                 if let Some(s) = kb.state.as_mut() {
                     s.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                    // Mirror Ctrl onto the pointer so click handlers can see it
+                    // (modifiers otherwise only reach us on a key event).
+                    state.pointer_state.ctrl =
+                        s.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
                 }
             }
             wl_keyboard::Event::Key {

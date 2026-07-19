@@ -6,9 +6,12 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::cli::{PickKind, Picker};
 use crate::geom::{Point, Rect};
 use crate::gfx::renderer2d::{DrawList, Rgba, TexSlot};
-use crate::model::{FileView, Node, NodeArena, NodeId, HEADER_H, ROW_ICON, ROW_ICON_GAP};
+use crate::model::{
+    Draft, FileView, Node, NodeArena, NodeBody, NodeId, HEADER_H, ROW_ICON, ROW_ICON_GAP,
+};
 use crate::platform::wayland::PointerState;
 use crate::text::{Icon, TextSystem};
 use crate::textfield::TextField;
@@ -47,6 +50,13 @@ pub enum Action {
     ResizeNode { node: NodeId },
     /// A row in the right-click context menu (acts on `ui.context_menu`).
     Menu(MenuItem),
+    /// Confirm the picker with the current choice. Only pushed when the choice
+    /// is valid, so an inert Accept button simply cannot be clicked.
+    PickAccept,
+    /// Dismiss the picker, returning nothing.
+    PickCancel,
+    /// Click into the draft node's filename field.
+    DraftField,
 }
 
 /// The entries in the right-click context menu.
@@ -173,6 +183,38 @@ pub struct Ui {
     /// px, from the last frame) for click-away detection.
     pub context_menu: Option<ContextMenu>,
     menu_rect: Rect,
+    /// Picker configuration when launched as a file selector; None in the
+    /// normal browser mode, which leaves every picker code path inert.
+    pub picker: Option<Picker>,
+    /// The draft ("new file") node, in save mode.
+    pub draft_node: Option<NodeId>,
+    /// Which text field has keyboard focus. Exactly one at a time.
+    pub focus: Focus,
+    /// The draft node's filename field rect (screen px, from the last built
+    /// frame), for click-to-place-caret. Rect::ZERO when not drawn.
+    pub draft_field_rect: Rect,
+}
+
+/// The text field currently taking keystrokes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    None,
+    Url,
+    Draft,
+}
+
+/// What the picker would return if confirmed right now.
+#[derive(Default)]
+pub struct PickerChoice {
+    pub paths: Vec<PathBuf>,
+    /// Nodes the picker wires originate from.
+    pub sources: Vec<NodeId>,
+    /// Whether Accept may be pressed.
+    pub valid: bool,
+    /// Save mode: the target exists and would be replaced.
+    pub overwrite: bool,
+    /// One-line status for the panel.
+    pub summary: String,
 }
 
 /// The world↔screen transform for canvas content. Screen/logical px; the
@@ -236,7 +278,129 @@ impl Ui {
             last_scroll: None,
             context_menu: None,
             menu_rect: Rect::ZERO,
+            picker: None,
+            draft_node: None,
+            focus: Focus::None,
+            draft_field_rect: Rect::ZERO,
         }
+    }
+
+    /// Give the keyboard to `focus`, deactivating whichever field had it.
+    pub fn set_focus(&mut self, arena: &mut NodeArena, focus: Focus) {
+        if self.focus == focus {
+            return;
+        }
+        if self.focus == Focus::Url {
+            self.url.cancel();
+        }
+        if self.focus == Focus::Draft {
+            if let Some(d) = self.draft_mut(arena) {
+                d.name.anchor = None;
+            }
+        }
+        self.focus = focus;
+    }
+
+    /// The draft node's editing state, if a draft node exists.
+    pub fn draft<'a>(&self, arena: &'a NodeArena) -> Option<&'a Draft> {
+        arena.get(self.draft_node?)?.body.draft()
+    }
+
+    pub fn draft_mut<'a>(&self, arena: &'a mut NodeArena) -> Option<&'a mut Draft> {
+        arena.get_mut(self.draft_node?)?.body.draft_mut()
+    }
+
+    /// The node a ctrl+click should toggle in the pick set, or None when the
+    /// click should keep its ordinary meaning. Only ever Some in a multi-select
+    /// picker, so ctrl+click is inert in normal browsing.
+    fn toggle_target(&self, arena: &NodeArena, action: Action, ctrl: bool) -> Option<NodeId> {
+        let picker = self.picker.as_ref()?;
+        if !ctrl || !picker.multiple {
+            return None;
+        }
+        // Only whole nodes toggle here. A ctrl+click on a *row* keeps its
+        // ordinary "open" meaning — main.rs then pins and adds the node it
+        // opened, which is what makes clicking several rows in a row work.
+        let node = match action {
+            Action::NodeBody { node } => node,
+            _ => return None,
+        };
+        let n = arena.get(node)?;
+        let wanted = match picker.kind {
+            PickKind::OpenDir => n.body.is_dir(),
+            _ => n.body.file().is_some(),
+        };
+        wanted.then_some(node)
+    }
+
+    /// What the picker would return right now. Recomputed each frame — it is
+    /// cheap, and it keeps the panel, the wires and the accept action reading
+    /// from a single source of truth.
+    pub fn picker_choice(&self, arena: &NodeArena) -> PickerChoice {
+        let mut choice = PickerChoice::default();
+        let Some(picker) = &self.picker else { return choice };
+
+        if picker.kind == PickKind::Save {
+            let Some(draft_id) = self.draft_node else { return choice };
+            let Some(node) = arena.get(draft_id) else { return choice };
+            let Some(draft) = node.body.draft() else { return choice };
+            choice.sources.push(draft_id);
+            let name = draft.name.text.trim();
+            // A name must be a single path component: no separators, and not a
+            // directory alias that would resolve to the parent.
+            if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+                choice.summary = "Enter a file name".to_string();
+                return choice;
+            }
+            let target = node.path.join(name);
+            choice.overwrite = target.exists();
+            choice.summary = target.to_string_lossy().into_owned();
+            choice.paths.push(target);
+            choice.valid = true;
+            return choice;
+        }
+
+        // Open modes: the marquee selection is the pick set, falling back to
+        // the active node when nothing has been marquee-selected.
+        let wants = |n: &Node| match picker.kind {
+            PickKind::OpenDir => n.body.is_dir(),
+            _ => n.body.file().is_some(),
+        };
+        let mut hits: Vec<(NodeId, PathBuf)> = self
+            .selected_nodes
+            .iter()
+            .filter_map(|id| arena.get(*id).map(|n| (*id, n)))
+            .filter(|(_, n)| wants(n))
+            .map(|(id, n)| (id, n.path.clone()))
+            .collect();
+        if hits.is_empty() {
+            if let Some((id, n)) = self.active_node.and_then(|id| arena.get(id).map(|n| (id, n))) {
+                if wants(n) {
+                    hits.push((id, n.path.clone()));
+                }
+            }
+        }
+        // HashSet order is arbitrary; sort so the returned list is stable.
+        hits.sort_by(|a, b| a.1.cmp(&b.1));
+
+        choice.summary = match hits.len() {
+            // Says what is *missing*, so it never just echoes the title.
+            0 => match picker.kind {
+                PickKind::OpenDir => "No folder selected".to_string(),
+                _ => "No file selected".to_string(),
+            },
+            1 => hits[0].1.to_string_lossy().into_owned(),
+            n => format!("{n} items selected"),
+        };
+        choice.valid = !hits.is_empty() && (picker.multiple || hits.len() == 1);
+        if !choice.valid && hits.len() > 1 {
+            choice.summary = "Select only one".to_string();
+        }
+        for (id, path) in hits {
+            choice.sources.push(id);
+            choice.paths.push(path);
+        }
+        choice
     }
 
     /// Center `rect` (world) in the safe area below the toolbar at the current
@@ -372,7 +536,7 @@ impl Ui {
                     .get(node)
                     .and_then(|n| n.items.get(item).map(|it| (n.path.join(&it.name), it.is_dir))),
                 Action::NodeBody { node } => {
-                    arena.get(node).map(|n| (n.path.clone(), n.file.is_none()))
+                    arena.get(node).map(|n| (n.path.clone(), n.body.is_dir()))
                 }
                 _ => None,
             });
@@ -523,21 +687,30 @@ impl Ui {
                     // File nodes resize freely (the image letterboxes); directory
                     // nodes resize vertically only — their width stays fit to the
                     // content so filenames never clip — and never taller than
-                    // their content (no empty space below the last row).
+                    // their content (no empty space below the last row). Draft
+                    // nodes are fixed-size and push no resize handle, so this is
+                    // unreachable for them.
                     if let Some(node) = arena.get_mut(id) {
                         let world_y = cursor.y / self.zoom + self.camera.y;
                         node.anim_to = None;
                         node.user_sized = true;
-                        if node.file.is_some() {
-                            let world_x = cursor.x / self.zoom + self.camera.x;
-                            let new_w = (world_x - node.rect.min.x).max(PREVIEW_MIN_W);
-                            let new_h = (world_y - node.rect.min.y).max(HEADER_H + 30.0);
-                            node.rect.max = Point::new(node.rect.min.x + new_w, node.rect.min.y + new_h);
-                        } else {
-                            let max_h = node.content_h.max(HEADER_H + 30.0);
-                            let new_h =
-                                (world_y - node.rect.min.y).clamp(HEADER_H + 30.0, max_h);
-                            node.rect.max.y = node.rect.min.y + new_h;
+                        match node.body {
+                            NodeBody::File(_) => {
+                                let world_x = cursor.x / self.zoom + self.camera.x;
+                                let new_w = (world_x - node.rect.min.x).max(PREVIEW_MIN_W);
+                                let new_h = (world_y - node.rect.min.y).max(HEADER_H + 30.0);
+                                node.rect.max = Point::new(
+                                    node.rect.min.x + new_w,
+                                    node.rect.min.y + new_h,
+                                );
+                            }
+                            NodeBody::Dir => {
+                                let max_h = node.content_h.max(HEADER_H + 30.0);
+                                let new_h =
+                                    (world_y - node.rect.min.y).clamp(HEADER_H + 30.0, max_h);
+                                node.rect.max.y = node.rect.min.y + new_h;
+                            }
+                            NodeBody::Draft(_) => {}
                         }
                         dirty = true;
                     }
@@ -561,7 +734,20 @@ impl Ui {
                     if !double {
                         self.last_click = Some((h.action, now));
                     }
-                    action = Some((h.action, double));
+                    // Ctrl+click builds the pick set by hand, the keyboard
+                    // counterpart to the rubber-band. It replaces the click's
+                    // normal effect rather than adding to it, so ctrl-clicking
+                    // never also navigates.
+                    match self.toggle_target(arena, h.action, pointer.ctrl) {
+                        Some(node) => {
+                            if !self.selected_nodes.insert(node) {
+                                self.selected_nodes.remove(&node);
+                            }
+                            self.last_click = None;
+                            dirty = true;
+                        }
+                        None => action = Some((h.action, double)),
+                    }
                 } else {
                     // A plain click on empty canvas drops the multi-selection.
                     self.last_click = None;
@@ -718,16 +904,29 @@ pub fn build_frame(
     // The current canvas root's path is the URL bar's default when nothing is
     // selected (there is always a node open).
     let root_path = arena.get(root).map(|n| n.path.clone());
-    // The scene (canvas) holds only the background — the grid and the connector
-    // wires — so it can be blurred and sampled *behind* each node. Nodes and
-    // everything above them render in the overlay, over the composited scene.
+    // The scene (canvas) holds only the background — the grid and every wire,
+    // connector and picker alike — so it can be blurred and sampled *behind*
+    // each node. Nodes and everything above them render in the overlay, over
+    // the composited scene. Picker wires belong here rather than in the overlay
+    // so they pass *under* nodes exactly as parent->child connectors do.
     draw_grid(canvas, view);
     draw_connectors(arena, root, canvas, view, cap, &path);
+    let choice = ui.picker.as_ref().map(|_| ui.picker_choice(arena));
+    if let Some(choice) = &choice {
+        let panel = picker_panel_rect(ts, window, choice);
+        draw_picker_wires(arena, canvas, view, choice, panel);
+    }
 
     // Composite the background, then draw the nodes on top; each node frosts the
     // lines behind it by sampling the blurred scene.
     overlay.image_slot(Rect::from_xywh(0.0, 0.0, window.x, window.y), TexSlot::Scene);
     draw_entries(ui, arena, root, ts, overlay, view, spin_angle, &path, &mut out);
+    // The draft node is unreachable from the root recursion (it has no parent
+    // item), so it draws here, with the other nodes and above the wires.
+    if let Some(choice) = &choice {
+        draw_draft_node(ui, arena, ts, overlay, view, caret_visible, choice.overwrite);
+    }
+
     // The rubber-band draws on top of the nodes, in screen px (like the grid).
     if let DragState::Marquee { origin } = ui.drag {
         let cur = ui.last_pointer;
@@ -739,6 +938,10 @@ pub fn build_frame(
         overlay.rect_stroke(band, COLOR_MULTISELECT, 0.0, 1.0);
     }
     draw_navigation(ui, ts, overlay, window, caret_visible, root_path.as_deref());
+    if let Some(choice) = &choice {
+        let panel = picker_panel_rect(ts, window, choice);
+        draw_picker_panel(ui, ts, overlay, panel, choice);
+    }
     // The context menu draws last of all, on top of the toolbar.
     draw_context_menu(ui, ts, overlay, window);
     out
@@ -904,17 +1107,35 @@ fn draw_grid(list: &mut DrawList, view: View) {
     }
 }
 
-/// A smooth cubic-bezier "wire" from `a` (parent edge) to `b` (child edge),
-/// leaving and arriving horizontally. Sampled in world space and emitted as
-/// short segments via `view`.
-fn draw_curve(list: &mut DrawList, view: View, a: Point, b: Point, width: f32, color: Rgba) {
+/// A smooth cubic-bezier "wire" from `a` to `b`, leaving and arriving
+/// horizontally, emitted as short segments.
+///
+/// Both endpoints are SCREEN space. The world→screen map is affine (uniform
+/// scale plus translation), so sampling the curve in screen space with
+/// screen-space control points is identical to sampling it in world space and
+/// mapping each sample — which lets canvas connectors (world endpoints, mapped
+/// by the caller) and picker wires (one endpoint already on screen) share one
+/// implementation. `min_reach` is the control-point floor, so world-space
+/// callers scale it by the zoom to keep the shape stable.
+///
+/// `dashed` drops every other segment, for the overwrite warning wire.
+#[allow(clippy::too_many_arguments)]
+fn draw_curve(
+    list: &mut DrawList,
+    a: Point,
+    b: Point,
+    min_reach: f32,
+    width: f32,
+    color: Rgba,
+    dashed: bool,
+) {
     const SEGMENTS: usize = 24;
     // Horizontal control-point reach: half the span, with a floor so short
     // hops still bow out a little.
-    let cx = ((b.x - a.x).abs() * 0.5).max(30.0);
+    let cx = ((b.x - a.x).abs() * 0.5).max(min_reach);
     let p1 = Point::new(a.x + cx, a.y);
     let p2 = Point::new(b.x - cx, b.y);
-    let mut prev = view.w2s(a);
+    let mut prev = a;
     for i in 1..=SEGMENTS {
         let t = i as f32 / SEGMENTS as f32;
         let u = 1.0 - t;
@@ -923,9 +1144,10 @@ fn draw_curve(list: &mut DrawList, view: View, a: Point, b: Point, width: f32, c
             w0 * a.x + w1 * p1.x + w2 * p2.x + w3 * b.x,
             w0 * a.y + w1 * p1.y + w2 * p2.y + w3 * b.y,
         );
-        let ps = view.w2s(p);
-        list.line(prev, ps, width, color);
-        prev = ps;
+        if !dashed || i % 2 == 1 {
+            list.line(prev, p, width, color);
+        }
+        prev = p;
     }
 }
 
@@ -959,7 +1181,7 @@ fn draw_connectors(
         let Some(node) = arena.get_mut(id) else { return };
         // Directory boxes fit their content; a user-resized box keeps its height
         // but still fits its width. File nodes are entirely user-sized.
-        if node.file.is_none() {
+        if node.body.is_dir() {
             clamp_dir_box(node, cap);
         }
         (node.rect, node.scroll)
@@ -989,7 +1211,15 @@ fn draw_connectors(
                 let color =
                     if path.contains(&child_id) { COLOR_PATH_BORDER } else { Rgba::WHITE };
                 let width = if path.contains(&child_id) { 4.0 } else { 3.0 };
-                draw_curve(list, view, a, b, width, color);
+                draw_curve(
+                    list,
+                    view.w2s(a),
+                    view.w2s(b),
+                    30.0 * view.zoom,
+                    width,
+                    color,
+                    false,
+                );
             }
         }
         draw_connectors(arena, child_id, list, view, cap, path);
@@ -1127,8 +1357,8 @@ fn draw_entries(
     // content-fit clamp (they keep whatever size the user gave them).
     let (node_rect, scroll, content_h, is_root, file_view, favorited, pinned, fname) = {
         let Some(node) = arena.get_mut(id) else { return };
-        let file_view = node.file.clone();
-        if file_view.is_none() {
+        let file_view = node.body.file().cloned();
+        if node.body.is_dir() {
             clamp_dir_box(node, cap);
         }
         let favorited = ui.favorites.contains(&node.path);
@@ -1312,6 +1542,366 @@ fn draw_entries(
     }
 }
 
+// ---------------------------------------------------------------- picker ---
+
+/// Picker wire + draft border colour: distinct from the amber active route and
+/// the cyan multi-select so three relationships can be on screen at once.
+const COLOR_PICK: Rgba = Rgba([80, 220, 170, 255]);
+/// Overwrite warning: the save target already exists.
+const COLOR_PICK_WARN: Rgba = Rgba([255, 120, 90, 255]);
+
+const PANEL_W: f32 = 300.0;
+const PANEL_MARGIN: f32 = 20.0;
+const PANEL_PAD: f32 = 12.0;
+const PANEL_BTN_H: f32 = 30.0;
+const PANEL_BTN_W: f32 = 92.0;
+const PANEL_BTN_GAP: f32 = 8.0;
+/// Never draw more wires than this; the panel's count carries the true total.
+const MAX_PICK_WIRES: usize = 12;
+
+/// The point on a node's box that a picker wire leaves from: whichever vertical
+/// edge faces `toward`, at mid-height. Screen space.
+fn wire_exit(r: Rect, toward: Point) -> Point {
+    Point::new(if r.center().x < toward.x { r.max.x } else { r.min.x }, r.center().y)
+}
+
+/// Wires from each chosen node to the picker panel. Emitted into the *canvas*
+/// list alongside the parent->child connectors, so nodes frost over them and
+/// they never cut across a box.
+///
+/// In save mode this draws two hops — `directory -> draft -> panel`. The
+/// directory hop is the one that carries the overwrite warning: it is the
+/// attachment that says where the new file lands, so it is where "that name is
+/// already taken" belongs.
+fn draw_picker_wires(
+    arena: &NodeArena,
+    list: &mut DrawList,
+    view: View,
+    choice: &PickerChoice,
+    panel: Rect,
+) {
+    let anchor = Point::new(panel.min.x, panel.center().y);
+    for id in choice.sources.iter().take(MAX_PICK_WIRES) {
+        let Some(node) = arena.get(*id) else { continue };
+        let r = view.w2s_rect(node.rect);
+        draw_curve(list, wire_exit(r, anchor), anchor, 40.0, 3.0, COLOR_PICK, false);
+
+        // The draft's attachment to the directory it will be written into.
+        if let Some(draft) = node.body.draft() {
+            if let Some(dir) = arena.get(draft.dir) {
+                let dr = view.w2s_rect(dir.rect);
+                let (color, dashed) = if choice.overwrite {
+                    (COLOR_PICK_WARN, true)
+                } else {
+                    (COLOR_PICK, false)
+                };
+                draw_curve(list, wire_exit(dr, r.center()), wire_exit(r, dr.center()), 40.0, 3.0, color, dashed);
+            }
+        }
+    }
+}
+
+/// Draft node box width, and the height needed for its header, name field and
+/// target-directory line.
+pub const DRAFT_NODE_W: f32 = 260.0;
+const DRAFT_PAD: f32 = 8.0;
+
+pub fn draft_node_height(ts: &TextSystem) -> f32 {
+    HEADER_H + DRAFT_PAD * 3.0 + ts.line_height() * 2.0
+}
+
+/// Draw the draft ("new file") node: a dashed-border box holding the filename
+/// being typed and the directory it will land in.
+///
+/// Drawn separately from `draw_entries` because a draft has no `parent` item,
+/// so the recursion from the root never reaches it.
+fn draw_draft_node(
+    ui: &mut Ui,
+    arena: &mut NodeArena,
+    ts: &mut TextSystem,
+    list: &mut DrawList,
+    view: View,
+    caret_visible: bool,
+    overwrite: bool,
+) {
+    let Some(id) = ui.draft_node else { return };
+    let Some((rect, dir_label)) = arena.get(id).map(|n| {
+        (n.rect, n.path.to_string_lossy().into_owned())
+    }) else {
+        ui.draft_field_rect = Rect::ZERO;
+        return;
+    };
+    if arena.get(id).and_then(|n| n.body.draft()).is_none() {
+        return;
+    }
+
+    let screen = view.w2s_rect(rect);
+    let z = view.zoom;
+    let lh = ts.line_height();
+    draw_node_backdrop(list, screen);
+    list.rect(screen, COLOR_BOX_FILL, 5.0);
+    // A dashed border marks it as not-yet-real, and turns to the warning colour
+    // when the name collides with an existing file.
+    draw_dashed_rect(list, screen, if overwrite { COLOR_PICK_WARN } else { COLOR_PICK }, 2.5);
+
+    // Header: icon plus a fixed title. No close/pin/star — a draft is not a
+    // node you keep or dismiss; the picker owns its lifetime.
+    let head = Rect {
+        min: rect.min,
+        max: Point::new(rect.max.x, rect.min.y + HEADER_H),
+    };
+    let icon_r = Rect::from_xywh(rect.min.x + 6.0, rect.min.y + (HEADER_H - 14.0) * 0.5, 14.0, 14.0);
+    list.icon_quad(view.w2s_rect(icon_r), ts.icon_uv(Icon::File), COLOR_PICK, 0.0);
+    ts.draw_clipped(
+        list,
+        view.w2s(Point::new(rect.min.x + 26.0, rect.min.y + (HEADER_H - lh) * 0.5)),
+        "New file",
+        Rgba::WHITE,
+        view.w2s_rect(head),
+        z,
+    );
+
+    // The name field, inset inside its own subtle box.
+    let field_box = Rect {
+        min: Point::new(rect.min.x + DRAFT_PAD, rect.min.y + HEADER_H + DRAFT_PAD),
+        max: Point::new(rect.max.x - DRAFT_PAD, rect.min.y + HEADER_H + DRAFT_PAD + lh + 4.0),
+    };
+    let field_screen = view.w2s_rect(field_box);
+    list.rect(field_screen, Rgba([255, 255, 255, 18]), 4.0);
+    if ui.focus == Focus::Draft {
+        list.rect_stroke(field_screen, COLOR_PICK, 4.0, 1.5);
+    }
+
+    // The target directory, dim, under the field.
+    let dir_y = field_box.max.y + DRAFT_PAD * 0.5;
+    ts.draw_clipped(
+        list,
+        view.w2s(Point::new(rect.min.x + DRAFT_PAD, dir_y)),
+        &format!("in {dir_label}"),
+        Rgba::new(1.0, 1.0, 1.0, 0.55),
+        screen,
+        z,
+    );
+
+    // The body swallows clicks (a draft is not "activated" like a real node)
+    // but still drags; the field on top of it takes focus.
+    ui.hitboxes.push(Hitbox { area: screen, action: Action::None, drag: DragKind::Node(id) });
+    ui.hitboxes.push(Hitbox {
+        area: field_screen,
+        action: Action::DraftField,
+        drag: DragKind::Node(id),
+    });
+
+    // Text area inside the field box, recorded for click-to-place-caret.
+    let text_area = Rect {
+        min: Point::new(field_screen.min.x + 5.0, field_screen.min.y + 2.0 * z),
+        max: Point::new(field_screen.max.x - 5.0, field_screen.min.y + 2.0 * z + lh * z),
+    };
+    ui.draft_field_rect = text_area;
+    let focused = ui.focus == Focus::Draft;
+    if let Some(draft) = arena.get_mut(id).and_then(|n| n.body.draft_mut()) {
+        draw_text_field(
+            ts,
+            list,
+            text_area,
+            field_screen,
+            &mut draft.name,
+            focused && caret_visible,
+            z,
+        );
+    }
+}
+
+/// The floating picker panel: title, what is currently chosen, an overwrite
+/// warning when relevant, and Cancel / Accept. Screen space, bottom-right.
+/// Returns its rect so the wires can aim at it.
+fn picker_panel_rect(ts: &TextSystem, window: Point, choice: &PickerChoice) -> Rect {
+    let lh = ts.line_height();
+    let warn_h = if choice.overwrite { lh } else { 0.0 };
+    let h = PANEL_PAD + lh + 6.0 + lh + warn_h + 10.0 + PANEL_BTN_H + PANEL_PAD;
+    Rect {
+        min: Point::new(window.x - PANEL_MARGIN - PANEL_W, window.y - PANEL_MARGIN - h),
+        max: Point::new(window.x - PANEL_MARGIN, window.y - PANEL_MARGIN),
+    }
+}
+
+fn draw_picker_panel(
+    ui: &mut Ui,
+    ts: &mut TextSystem,
+    list: &mut DrawList,
+    panel: Rect,
+    choice: &PickerChoice,
+) {
+    let Some(picker) = &ui.picker else { return };
+    let (title, accept_label) = (picker.title(), picker.accept_label());
+
+    // Soft shadow, then the frosted backdrop — same recipe as the context menu.
+    for i in 0..5 {
+        let g = (i + 1) as f32 * 2.0;
+        list.rect(inflate(panel, g), Rgba([0, 0, 0, 18]), MENU_RADIUS + g);
+    }
+    list.image_rrect(panel, TexSlot::Blur, MENU_RADIUS);
+    list.rect(panel, MENU_BG, MENU_RADIUS);
+    list.rect_stroke(panel, MENU_BORDER, MENU_RADIUS, 1.0);
+    // Swallow clicks anywhere on the panel so the canvas beneath is inert.
+    ui.hitboxes.push(Hitbox { area: panel, action: Action::None, drag: DragKind::None });
+
+    let lh = ts.line_height();
+    let clip = inflate(panel, -PANEL_PAD * 0.5);
+    let x = panel.min.x + PANEL_PAD;
+    let mut y = panel.min.y + PANEL_PAD;
+    ts.draw_clipped(list, Point::new(x, y), title, Rgba::WHITE, clip, 1.0);
+    y += lh + 6.0;
+
+    let dim = Rgba::new(1.0, 1.0, 1.0, 0.7);
+    let summary_color = if choice.valid { dim } else { Rgba::new(1.0, 1.0, 1.0, 0.45) };
+    ts.draw_clipped(list, Point::new(x, y), &choice.summary, summary_color, clip, 1.0);
+    y += lh;
+
+    if choice.overwrite {
+        ts.draw_clipped(
+            list,
+            Point::new(x, y),
+            "Replaces the existing file",
+            COLOR_PICK_WARN,
+            clip,
+            1.0,
+        );
+        y += lh;
+    }
+    y += 10.0;
+
+    // Accept sits rightmost. When the choice is invalid it is drawn dim and NO
+    // hitbox is pushed, so it is not merely ignored — it cannot be clicked.
+    let accept = Rect::from_xywh(
+        panel.max.x - PANEL_PAD - PANEL_BTN_W,
+        y,
+        PANEL_BTN_W,
+        PANEL_BTN_H,
+    );
+    let cancel = Rect::from_xywh(
+        accept.min.x - PANEL_BTN_GAP - PANEL_BTN_W,
+        y,
+        PANEL_BTN_W,
+        PANEL_BTN_H,
+    );
+
+    draw_panel_button(ui, ts, list, cancel, "Cancel", true, Action::PickCancel, BtnStyle::Plain);
+    // Replacing a file is destructive, so the confirm button says so in colour
+    // as well as in words.
+    let (accept_text, style) = if choice.overwrite {
+        ("Replace", BtnStyle::Danger)
+    } else {
+        (accept_label, BtnStyle::Primary)
+    };
+    draw_panel_button(ui, ts, list, accept, accept_text, choice.valid, Action::PickAccept, style);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BtnStyle {
+    Plain,
+    Primary,
+    Danger,
+}
+
+/// One panel button. `enabled == false` draws it dim and pushes no hitbox, so
+/// an unmet requirement makes the button genuinely unclickable.
+#[allow(clippy::too_many_arguments)]
+fn draw_panel_button(
+    ui: &mut Ui,
+    ts: &mut TextSystem,
+    list: &mut DrawList,
+    r: Rect,
+    label: &str,
+    enabled: bool,
+    action: Action,
+    style: BtnStyle,
+) {
+    let hovered = enabled && ui.hover == Some(action);
+    let solid = |c: Rgba, hov: bool| {
+        let Rgba([r, g, b, _]) = c;
+        Rgba([r, g, b, if hov { 235 } else { 190 }])
+    };
+    let (fill, text) = match (enabled, style) {
+        (false, _) => (Rgba([255, 255, 255, 12]), Rgba::new(1.0, 1.0, 1.0, 0.3)),
+        (true, BtnStyle::Primary) => (solid(COLOR_PICK, hovered), Rgba([10, 24, 20, 255])),
+        (true, BtnStyle::Danger) => (solid(COLOR_PICK_WARN, hovered), Rgba([28, 10, 6, 255])),
+        (true, BtnStyle::Plain) => (
+            if hovered { Rgba([255, 255, 255, 46]) } else { Rgba([255, 255, 255, 26]) },
+            Rgba::WHITE,
+        ),
+    };
+    list.rect(r, fill, 6.0);
+    let tw = ts.measure(label).x;
+    let origin = Point::new(
+        r.center().x - tw * 0.5,
+        r.center().y - ts.line_height() * 0.5,
+    );
+    ts.draw_clipped(list, origin, label, text, r, 1.0);
+    if enabled {
+        ui.hitboxes.push(Hitbox { area: r, action, drag: DragKind::None });
+    }
+}
+
+/// Highlight behind selected text in an editable field.
+const FIELD_SELECTION_BG: Rgba = Rgba([90, 140, 255, 115]); // ~(0.35,0.55,1.0,0.45)
+
+/// Draw an editable `TextField`: horizontal scroll-to-caret, selection
+/// highlight, clipped text and the blinking caret.
+///
+/// `area` is the SCREEN-space box the text occupies (already inset by whatever
+/// padding the caller wants) and `clip` the screen rect to clip against. The
+/// field's own metrics (`caret_x`, `scroll`, `measure`) are unscaled logical
+/// units, so they are multiplied by `zoom` at placement — which lets the same
+/// code serve the screen-space URL bar (`zoom = 1.0`) and a field inside a
+/// world-space node, where the caller passes `view.w2s_rect(..)` and
+/// `view.zoom`.
+fn draw_text_field(
+    ts: &mut TextSystem,
+    list: &mut DrawList,
+    area: Rect,
+    clip: Rect,
+    f: &mut TextField,
+    caret_visible: bool,
+    zoom: f32,
+) {
+    // Keep the caret in view within the field (all in logical units).
+    let avail = (area.width() / zoom.max(0.0001)).max(10.0);
+    let caret_x = ts.caret_x(&f.text, f.caret);
+    if caret_x - f.scroll > avail {
+        f.scroll = caret_x - avail;
+    }
+    if caret_x < f.scroll {
+        f.scroll = caret_x;
+    }
+    let text_w = ts.measure(&f.text).x;
+    f.scroll = f.scroll.clamp(0.0, (text_w - avail).max(0.0));
+
+    let origin = Point::new(area.min.x - f.scroll * zoom, area.min.y);
+    let lh = ts.line_height() * zoom;
+    if let Some((s, e)) = f.selection() {
+        let x0 = origin.x + ts.caret_x(&f.text, s) * zoom;
+        let x1 = origin.x + ts.caret_x(&f.text, e) * zoom;
+        let sel =
+            Rect { min: Point::new(x0, area.min.y), max: Point::new(x1, area.min.y + lh) };
+        if let Some(r) = sel.intersect(clip) {
+            list.rect(r, FIELD_SELECTION_BG, 0.0);
+        }
+    }
+    ts.draw_clipped(list, origin, &f.text, Rgba::WHITE, clip, zoom);
+    if caret_visible {
+        // The caret keeps a screen-space width so it stays visible zoomed out.
+        let x = origin.x + caret_x * zoom;
+        let caret = Rect {
+            min: Point::new(x, area.min.y + 1.0),
+            max: Point::new(x + 1.5, area.min.y + lh - 1.0),
+        };
+        if let Some(r) = caret.intersect(clip) {
+            list.rect(r, Rgba::WHITE, 0.0);
+        }
+    }
+}
+
 /// Port of draw_navigation: scene composite, frosted toolbar bar, six icon
 /// buttons, URL bar.
 fn draw_navigation(
@@ -1374,37 +1964,11 @@ fn draw_navigation(
     let text_y = url_bar.min.y + 2.0;
 
     if focused {
-        // Keep the caret in view within the field.
-        let avail = (url_bar.width() - 2.0 * URL_PAD).max(10.0);
-        let caret_x = ts.caret_x(&ui.url.text, ui.url.caret);
-        if caret_x - ui.url.scroll > avail {
-            ui.url.scroll = caret_x - avail;
-        }
-        if caret_x < ui.url.scroll {
-            ui.url.scroll = caret_x;
-        }
-        let text_w = ts.measure(&ui.url.text).x;
-        ui.url.scroll = ui.url.scroll.clamp(0.0, (text_w - avail).max(0.0));
-
-        let origin = Point::new(url_bar.min.x + URL_PAD - ui.url.scroll, text_y);
-        let lh = ts.line_height();
-        if let Some((s, e)) = ui.url.selection() {
-            let x0 = origin.x + ts.caret_x(&ui.url.text, s);
-            let x1 = origin.x + ts.caret_x(&ui.url.text, e);
-            let sel = Rect { min: Point::new(x0, text_y), max: Point::new(x1, text_y + lh) };
-            if let Some(r) = sel.intersect(clip) {
-                list.rect(r, Rgba::new(0.35, 0.55, 1.0, 0.45), 0.0);
-            }
-        }
-        ts.draw_clipped(list, origin, &ui.url.text, Rgba::WHITE, clip, 1.0);
-        if caret_visible {
-            let x = origin.x + caret_x;
-            let caret =
-                Rect { min: Point::new(x, text_y + 1.0), max: Point::new(x + 1.5, text_y + lh - 1.0) };
-            if let Some(r) = caret.intersect(clip) {
-                list.rect(r, Rgba::WHITE, 0.0);
-            }
-        }
+        let area = Rect {
+            min: Point::new(url_bar.min.x + URL_PAD, text_y),
+            max: Point::new(url_bar.max.x - URL_PAD, text_y + ts.line_height()),
+        };
+        draw_text_field(ts, list, area, clip, &mut ui.url, caret_visible, 1.0);
     } else {
         // Show the selected path, or fall back to the active (root) node's
         // path so the bar always reflects where you are.
@@ -1413,5 +1977,163 @@ fn draw_navigation(
             None => "No selection...".to_string(),
         };
         ts.draw_clipped(list, Point::new(url_bar.min.x + URL_PAD, text_y), &text, Rgba::WHITE, clip, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::Picker;
+    use crate::model::{self, FileMeta, ItemData};
+
+    fn meta() -> FileMeta {
+        FileMeta { size: 0, mode: 0o644, uid: 0, gid: 0, mtime: 0, ctime: 0 }
+    }
+
+    /// A directory node holding `names` as rows, plus a file node opened for
+    /// each name. Returns the arena, the dir id, and the file node ids in the
+    /// order the names were given.
+    fn scene(dir: &str, names: &[&str]) -> (NodeArena, NodeId, Vec<NodeId>) {
+        let mut arena = NodeArena::new();
+        let items: Vec<ItemData> = names
+            .iter()
+            .map(|n| ItemData { name: std::ffi::OsString::from(n), is_dir: false })
+            .collect();
+        let dir_id = arena.insert(model::node_from_items(PathBuf::from(dir), items));
+        let mut files = Vec::new();
+        for (i, n) in names.iter().enumerate() {
+            let id = arena.insert(model::file_node(
+                PathBuf::from(dir).join(n),
+                (dir_id, i),
+                meta(),
+                None,
+                Rect::ZERO,
+                true,
+            ));
+            files.push(id);
+        }
+        (arena, dir_id, files)
+    }
+
+    fn ui_with(picker: Picker) -> Ui {
+        let mut ui = Ui::new();
+        ui.picker = Some(picker);
+        ui
+    }
+
+    fn open(kind: PickKind, multiple: bool) -> Picker {
+        Picker { kind, multiple, out: None, save_name: String::new() }
+    }
+
+    #[test]
+    fn open_file_falls_back_to_the_active_node() {
+        let (arena, _dir, files) = scene("/d", &["a.txt"]);
+        let mut ui = ui_with(open(PickKind::OpenFile, false));
+        ui.active_node = Some(files[0]);
+        let c = ui.picker_choice(&arena);
+        assert!(c.valid);
+        assert_eq!(c.paths, vec![PathBuf::from("/d/a.txt")]);
+    }
+
+    #[test]
+    fn a_directory_is_not_a_valid_file_pick() {
+        let (arena, dir, _files) = scene("/d", &["a.txt"]);
+        let mut ui = ui_with(open(PickKind::OpenFile, false));
+        ui.active_node = Some(dir);
+        assert!(!ui.picker_choice(&arena).valid);
+
+        // ...and the converse: a file is not a valid folder pick.
+        let (arena2, _d2, files2) = scene("/d", &["a.txt"]);
+        let mut ui2 = ui_with(open(PickKind::OpenDir, false));
+        ui2.active_node = Some(files2[0]);
+        assert!(!ui2.picker_choice(&arena2).valid);
+    }
+
+    #[test]
+    fn multi_pick_returns_every_selected_path_sorted() {
+        // Insertion order deliberately differs from sorted order, and the
+        // selection lives in a HashSet, so this pins down the sort.
+        let (arena, _dir, files) = scene("/d", &["c.txt", "a.txt", "b.txt"]);
+        let mut ui = ui_with(open(PickKind::OpenFile, true));
+        ui.selected_nodes.extend(files.iter().copied());
+        let c = ui.picker_choice(&arena);
+        assert!(c.valid);
+        assert_eq!(
+            c.paths,
+            vec![
+                PathBuf::from("/d/a.txt"),
+                PathBuf::from("/d/b.txt"),
+                PathBuf::from("/d/c.txt")
+            ]
+        );
+        assert_eq!(c.sources.len(), 3);
+    }
+
+    #[test]
+    fn single_pick_rejects_a_multi_selection() {
+        let (arena, _dir, files) = scene("/d", &["a.txt", "b.txt"]);
+        let mut ui = ui_with(open(PickKind::OpenFile, false));
+        ui.selected_nodes.extend(files.iter().copied());
+        let c = ui.picker_choice(&arena);
+        assert!(!c.valid, "two files chosen in a single-file picker");
+        assert_eq!(c.summary, "Select only one");
+    }
+
+    #[test]
+    fn selection_ignores_nodes_of_the_wrong_kind_and_stale_ids() {
+        let (mut arena, dir, files) = scene("/d", &["a.txt", "b.txt"]);
+        let mut ui = ui_with(open(PickKind::OpenFile, true));
+        // The directory is selected too, and one file id goes stale.
+        ui.selected_nodes.extend(files.iter().copied());
+        ui.selected_nodes.insert(dir);
+        arena.close_recursive(files[1]);
+        let c = ui.picker_choice(&arena);
+        assert!(c.valid);
+        assert_eq!(c.paths, vec![PathBuf::from("/d/a.txt")]);
+    }
+
+    fn save_scene(dir: &str, name: &str) -> (NodeArena, Ui) {
+        let mut arena = NodeArena::new();
+        let dir_id = arena.insert(model::node_from_items(PathBuf::from(dir), Vec::new()));
+        let draft = arena.insert(model::draft_node(
+            dir_id,
+            PathBuf::from(dir),
+            name.to_string(),
+            Rect::ZERO,
+        ));
+        let mut ui = ui_with(Picker {
+            kind: PickKind::Save,
+            multiple: false,
+            out: None,
+            save_name: String::new(),
+        });
+        ui.draft_node = Some(draft);
+        (arena, ui)
+    }
+
+    #[test]
+    fn save_joins_the_name_onto_the_draft_directory() {
+        let (arena, ui) = save_scene("/tmp", "report.pdf");
+        let c = ui.picker_choice(&arena);
+        assert!(c.valid);
+        assert_eq!(c.paths, vec![PathBuf::from("/tmp/report.pdf")]);
+        assert!(!c.overwrite, "/tmp/report.pdf is not expected to exist");
+    }
+
+    #[test]
+    fn save_rejects_names_that_are_not_a_single_component() {
+        for bad in ["", "   ", "a/b", ".", ".."] {
+            let (arena, ui) = save_scene("/tmp", bad);
+            assert!(!ui.picker_choice(&arena).valid, "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn save_flags_an_existing_target_as_an_overwrite() {
+        // /etc/hostname is a stable, always-present file on this platform.
+        let (arena, ui) = save_scene("/etc", "hostname");
+        let c = ui.picker_choice(&arena);
+        assert!(c.valid, "overwriting is allowed, just flagged");
+        assert!(c.overwrite);
     }
 }

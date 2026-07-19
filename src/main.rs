@@ -1,3 +1,4 @@
+mod cli;
 mod geom;
 mod gfx;
 mod handlers;
@@ -104,6 +105,17 @@ impl PreviewTextures {
 }
 
 fn main() {
+    let args = cli::parse(std::env::args().skip(1)).unwrap_or_else(|msg| {
+        // `--help` returns the usage text as an "error"; a real parse failure
+        // is distinguished by not being the usage text alone.
+        if msg == cli::USAGE {
+            print!("{msg}");
+            std::process::exit(0);
+        }
+        eprintln!("{msg}");
+        std::process::exit(2);
+    });
+
     let platform::wayland::Init { conn, mut queue, mut platform } =
         platform::wayland::init("Kallos Explore", "kallos-explore", (1280, 720))
             .unwrap_or_else(|e| {
@@ -162,12 +174,24 @@ fn main() {
     model::calc_size(&mut arena, root, &mut ts, ui::node_max_size(window0));
 
     let mut ui = Ui::new();
-    // Open the chain of nodes down to home and focus it; snap (no startup pan).
-    navigate_to(&mut arena, &mut ui, &mut ts, root, &home, window0);
+    ui.picker = args.picker;
+    // Open the chain of nodes down to the landing directory and focus it; snap
+    // (no startup pan). `--start` overrides home, for pickers launched with a
+    // suggested location.
+    let start_dir = args.start.clone().unwrap_or_else(|| home.clone());
+    navigate_to(&mut arena, &mut ui, &mut ts, root, &start_dir, window0);
     // Pin the landing node (and its chain) so browsing elsewhere doesn't
     // collapse the home view the app opened to.
     if let Some(active) = ui.active_node {
         pin_node(&mut arena, active);
+    }
+    // Save mode opens with the draft node already attached to the landing
+    // directory, its name prefilled from `--save NAME` and focused for typing.
+    if let (Some(picker), Some(active)) = (&ui.picker, ui.active_node) {
+        if picker.kind == cli::PickKind::Save {
+            let name = picker.save_name.clone();
+            create_draft_node(&mut arena, &mut ui, &ts, active, name);
+        }
     }
     ui.camera = ui.camera_target;
     ui.refocus = false;
@@ -187,6 +211,9 @@ fn main() {
     let mut animating = true;
     let mut blink_epoch = Instant::now();
     let mut last_caret_visible = true;
+    // Set when the user confirms a picker; None all the way to the end means
+    // they cancelled.
+    let mut picker_result: Option<Vec<PathBuf>> = None;
 
     while platform.running {
         queue.flush().ok();
@@ -211,7 +238,7 @@ fn main() {
                 if let Some(d) = platform.next_repeat_deadline() {
                     consider(d, &mut t);
                 }
-                if ui.url.active {
+                if ui.focus != ui::Focus::None {
                     // Wake for the next caret blink toggle.
                     let elapsed = now.duration_since(blink_epoch).as_millis() as u64;
                     let to_next = CARET_BLINK_MS - (elapsed % CARET_BLINK_MS);
@@ -253,7 +280,7 @@ fn main() {
                         .and_then(|n| n.items.get(item))
                         .and_then(|it| it.child);
                     let attach = child.and_then(|c| arena.get(c)).is_some_and(|c| {
-                        c.path == path && c.file.as_ref().is_some_and(|f| f.image.is_none())
+                        c.path == path && c.body.file().is_some_and(|f| f.image.is_none())
                     });
                     if let (true, Some(child_id), Some(img)) = (attach, child, image) {
                         match make_preview_texture(&gfx, &renderer, &img) {
@@ -312,7 +339,7 @@ fn main() {
         // Keyboard: repeats + URL bar editing.
         platform.process_key_repeats(Instant::now());
         let key_events: Vec<KeyEvent> = platform.key_events.drain(..).collect();
-        if ui.url.active {
+        if ui.focus == ui::Focus::Url {
             for ev in &key_events {
                 match handle_url_key(ev, &mut ui.url) {
                     UrlOutcome::None => {}
@@ -320,7 +347,10 @@ fn main() {
                         blink_epoch = Instant::now();
                         dirty = true;
                     }
-                    UrlOutcome::Cancel => dirty = true,
+                    UrlOutcome::Cancel => {
+                        ui.focus = ui::Focus::None;
+                        dirty = true;
+                    }
                     UrlOutcome::Copy => {
                         if let Some(t) = ui.url.selected_text() {
                             platform.set_clipboard(&qh, t.to_owned());
@@ -349,30 +379,99 @@ fn main() {
                             && navigate_to(&mut arena, &mut ui, &mut ts, root, &path, window)
                         {
                             ui.url.cancel();
+                            ui.focus = ui::Focus::None;
                         }
                         // Invalid path: stay in the editor so it can be fixed.
                         dirty = true;
                     }
                 }
             }
+        } else if ui.focus == ui::Focus::Draft {
+            // The draft node's filename field reuses the URL bar's key mapping;
+            // only the commit and cancel meanings differ.
+            for ev in &key_events {
+                let outcome = match ui.draft_mut(&mut arena) {
+                    Some(d) => handle_url_key(ev, &mut d.name),
+                    None => break,
+                };
+                match outcome {
+                    UrlOutcome::None => {}
+                    UrlOutcome::Edited => {
+                        blink_epoch = Instant::now();
+                        dirty = true;
+                    }
+                    // Esc leaves the field but keeps the picker open.
+                    UrlOutcome::Cancel => {
+                        ui.set_focus(&mut arena, ui::Focus::None);
+                        dirty = true;
+                    }
+                    UrlOutcome::Copy => {
+                        if let Some(t) = ui
+                            .draft(&arena)
+                            .and_then(|d| d.name.selected_text().map(str::to_owned))
+                        {
+                            platform.set_clipboard(&qh, t);
+                        }
+                    }
+                    UrlOutcome::Cut => {
+                        if let Some(t) = ui
+                            .draft(&arena)
+                            .and_then(|d| d.name.selected_text().map(str::to_owned))
+                        {
+                            platform.set_clipboard(&qh, t);
+                            if let Some(d) = ui.draft_mut(&mut arena) {
+                                d.name.delete_selection();
+                            }
+                            blink_epoch = Instant::now();
+                            dirty = true;
+                        }
+                    }
+                    UrlOutcome::Paste => {
+                        if let Some(t) = platform.clipboard_text(&conn) {
+                            if let Some(d) = ui.draft_mut(&mut arena) {
+                                d.name.insert(&t);
+                            }
+                            blink_epoch = Instant::now();
+                            dirty = true;
+                        }
+                    }
+                    // Enter in the name field confirms the save.
+                    UrlOutcome::Commit(_) => {
+                        let choice = ui.picker_choice(&arena);
+                        if choice.valid {
+                            picker_result = Some(choice.paths);
+                            platform.running = false;
+                        }
+                        dirty = true;
+                    }
+                }
+            }
         } else {
             // Canvas keys: Space pins the active node (file or directory) so it
-            // stays open, along with its ancestor chain.
+            // stays open, along with its ancestor chain. Esc cancels a picker.
             for ev in &key_events {
                 if ev.keysym.raw() == ks::KEY_space {
                     if let Some(active) = ui.active_node {
                         pin_node(&mut arena, active);
                         dirty = true;
                     }
+                } else if ev.keysym.raw() == ks::KEY_Escape && ui.picker.is_some() {
+                    platform.running = false;
                 }
             }
         }
 
-        // Click outside the URL bar drops editing (back to selection display).
-        if platform.pointer_state.pressed && ui.url.active {
+        // A click outside the focused field drops editing (the URL bar falls
+        // back to its selection display; the draft keeps its text, just unfocused).
+        if platform.pointer_state.pressed && ui.focus != ui::Focus::None {
             let cur = Point::new(platform.pointer_state.x as f32, platform.pointer_state.y as f32);
-            if !ui.url_bar_rect.contains(cur) {
-                ui.url.cancel();
+            let inside = match ui.focus {
+                ui::Focus::Url => ui.url_bar_rect.contains(cur),
+                ui::Focus::Draft => ui.draft_field_rect.contains(cur),
+                ui::Focus::None => true,
+            };
+            if !inside {
+                ui.set_focus(&mut arena, ui::Focus::None);
                 dirty = true;
             }
         }
@@ -392,12 +491,38 @@ fn main() {
                         .or_else(|| arena.get(root).map(|n| n.path.clone()))
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    ui.set_focus(&mut arena, ui::Focus::None);
                     ui.url.begin(initial, 0);
+                    ui.focus = ui::Focus::Url;
                 }
                 let local =
                     ui.last_pointer.x - (ui.url_bar_rect.min.x + ui::URL_PAD) + ui.url.scroll;
                 ui.url.caret = ts.caret_index(&ui.url.text, local.max(0.0));
                 ui.url.anchor = None;
+                blink_epoch = Instant::now();
+                dirty = true;
+            } else if matches!(action, Action::PickAccept) {
+                // The button only exists when the choice is valid, but re-check
+                // rather than trust a hitbox from the previous frame.
+                let choice = ui.picker_choice(&arena);
+                if choice.valid {
+                    picker_result = Some(choice.paths);
+                    platform.running = false;
+                }
+            } else if matches!(action, Action::PickCancel) {
+                platform.running = false;
+            } else if matches!(action, Action::DraftField) {
+                // Focus the name field and place the caret at the click. The
+                // recorded rect is screen space, so unscale by the zoom to get
+                // back to the field's own logical units.
+                ui.set_focus(&mut arena, ui::Focus::Draft);
+                let z = ui.zoom.max(0.0001);
+                let scroll = ui.draft(&arena).map(|d| d.name.scroll).unwrap_or(0.0);
+                let local = (ui.last_pointer.x - ui.draft_field_rect.min.x) / z + scroll;
+                if let Some(d) = ui.draft_mut(&mut arena) {
+                    d.name.caret = ts.caret_index(&d.name.text, local.max(0.0));
+                    d.name.anchor = None;
+                }
                 blink_epoch = Instant::now();
                 dirty = true;
             } else if matches!(action, Action::FocusHome) {
@@ -472,6 +597,26 @@ fn main() {
                     &mut children,
                     window,
                 );
+                // Ctrl+clicking a *row* in a multi-select picker keeps what it
+                // opens: the node is pinned (so the next peek's prune doesn't
+                // close it) and joins the pick set. Without the pin, building a
+                // multi-selection by clicking rows would close each node as the
+                // next one opened.
+                let multi = ui.picker.as_ref().map(|p| (p.multiple, p.kind));
+                if let (Some((true, kind)), true, Action::Row { .. }) =
+                    (multi, platform.pointer_state.ctrl, action)
+                {
+                    if let Some(a) = ui.active_node {
+                        let wanted = arena.get(a).is_some_and(|n| match kind {
+                            cli::PickKind::OpenDir => n.body.is_dir(),
+                            _ => n.body.file().is_some(),
+                        });
+                        if wanted {
+                            pin_node(&mut arena, a);
+                            ui.selected_nodes.insert(a);
+                        }
+                    }
+                }
                 dirty = true;
             }
         }
@@ -490,7 +635,7 @@ fn main() {
             dirty = true;
         }
 
-        let caret_visible = if ui.url.active {
+        let caret_visible = if ui.focus != ui::Focus::None {
             let visible =
                 Instant::now().duration_since(blink_epoch).as_millis() as u64 / CARET_BLINK_MS % 2
                     == 0;
@@ -556,7 +701,7 @@ fn main() {
                 // Free textures of any file node that was closed.
                 let live: HashSet<u32> = arena
                     .iter()
-                    .filter_map(|(_, n)| n.file.as_ref().and_then(|f| f.image).map(|img| img.tex))
+                    .filter_map(|(_, n)| n.body.file().and_then(|f| f.image).map(|img| img.tex))
                     .collect();
                 ptex.retire_unused(&live, frame_counter);
                 ptex.destroy_old(&gfx.device, &renderer, frame_counter);
@@ -598,6 +743,43 @@ fn main() {
         ptex.destroy_all(&gfx.device);
     }
     renderer.destroy(&gfx.device);
+
+    // Picker modes answer their caller only after the loop has exited, so the
+    // Vulkan/Wayland teardown above always runs. Cancelling (Esc, the Cancel
+    // button, or closing the window) leaves `picker_result` None and exits 1.
+    if let Some(picker) = &ui.picker {
+        match picker_result {
+            Some(paths) => {
+                if let Err(e) = write_picker_result(picker.out.as_deref(), &paths) {
+                    eprintln!("failed to write picker result: {e}");
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            }
+            None => std::process::exit(1),
+        }
+    }
+}
+
+/// Write the chosen paths, one per line, to `out` or stdout. Plain paths (not
+/// file:// URIs) — that is the format xdg-desktop-portal-termfilechooser reads
+/// back from its output file.
+fn write_picker_result(out: Option<&Path>, paths: &[PathBuf]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut buf = String::new();
+    for p in paths {
+        buf.push_str(&p.to_string_lossy());
+        buf.push('\n');
+    }
+    match out {
+        Some(path) => std::fs::write(path, buf),
+        None => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            lock.write_all(buf.as_bytes())?;
+            lock.flush()
+        }
+    }
 }
 
 enum UrlOutcome {
@@ -914,16 +1096,20 @@ fn handle_action(
                 }
             }
         }
-        // UrlBar, FocusHome, GoUp, CopyPath and Menu are handled inline in the
-        // main loop (they need text/caret state, navigate_to, or the platform
-        // clipboard); ResizeNode is press-driven.
+        // UrlBar, FocusHome, GoUp, CopyPath, Menu and the picker actions are
+        // handled inline in the main loop (they need text/caret state,
+        // navigate_to, the platform clipboard, or the exit path); ResizeNode is
+        // press-driven.
         Action::None
         | Action::UrlBar
         | Action::FocusHome
         | Action::GoUp
         | Action::CopyPath
         | Action::Menu(_)
-        | Action::ResizeNode { .. } => {}
+        | Action::ResizeNode { .. }
+        | Action::PickAccept
+        | Action::PickCancel
+        | Action::DraftField => {}
     }
 }
 
@@ -962,6 +1148,73 @@ fn prune_transients(arena: &mut NodeArena, active: Option<NodeId>) {
 fn activate(arena: &mut NodeArena, ui: &mut Ui, node: NodeId) {
     ui.set_active(arena, Some(node));
     prune_transients(arena, Some(node));
+    rebind_draft(arena, ui);
+}
+
+/// Point the draft node at the directory the active route now sits in, so the
+/// "new file" box always says where it would be written.
+///
+/// A file node counts as its parent directory — selecting an existing file in
+/// save mode means "put it here, under that name", which is exactly the
+/// overwrite case the wire warns about.
+fn rebind_draft(arena: &mut NodeArena, ui: &mut Ui) {
+    let Some(draft_id) = ui.draft_node else { return };
+    let Some(active) = ui.active_node else { return };
+    if active == draft_id {
+        return;
+    }
+    let Some(node) = arena.get(active) else { return };
+    let dir_id = if node.body.is_dir() { Some(active) } else { node.parent.map(|(p, _)| p) };
+    let Some(dir_id) = dir_id else { return };
+    let Some(dir_path) = arena.get(dir_id).map(|n| n.path.clone()) else { return };
+
+    // Clicking an existing file also offers its name, so overwriting is one
+    // click rather than retyping.
+    let file_name = (!node.body.is_dir())
+        .then(|| node.path.file_name().map(|s| s.to_string_lossy().into_owned()))
+        .flatten();
+
+    if let Some(d) = arena.get_mut(draft_id) {
+        d.path = dir_path;
+        if let Some(draft) = d.body.draft_mut() {
+            draft.dir = dir_id;
+            if let Some(name) = file_name {
+                draft.name.text = name;
+                draft.name.caret = draft.name.text.len();
+                draft.name.anchor = None;
+            }
+        }
+    }
+}
+
+/// Create the draft ("new file") node beside `dir`, for save mode.
+fn create_draft_node(
+    arena: &mut NodeArena,
+    ui: &mut Ui,
+    ts: &TextSystem,
+    dir: NodeId,
+    name: String,
+) {
+    let Some(d) = arena.get(dir) else { return };
+    let origin = Point::new(d.rect.max.x + 20.0, d.rect.min.y);
+    let dir_path = d.path.clone();
+    let rect = geom::Rect::from_xywh(
+        origin.x,
+        origin.y,
+        ui::DRAFT_NODE_W,
+        ui::draft_node_height(ts),
+    );
+    let id = arena.insert(model::draft_node(dir, dir_path, name, rect));
+    let obstacles: Vec<geom::Rect> =
+        arena.iter().filter(|(x, _)| *x != id).map(|(_, n)| n.rect).collect();
+    let target = model::resolve_collision(rect, &obstacles, false);
+    if let Some(n) = arena.get_mut(id) {
+        if target != rect {
+            n.rect = geom::Rect::from_xywh(target.min.x, target.min.y, rect.width(), rect.height());
+        }
+    }
+    ui.draft_node = Some(id);
+    ui.focus = ui::Focus::Draft;
 }
 
 /// Default file-node width; the height is the header plus the info panel (an
@@ -1031,7 +1284,7 @@ fn attach_image(
     n.rect.max = Point::new(n.rect.min.x + w, n.rect.min.y + box_h);
     n.content_w = w;
     n.content_h = box_h;
-    if let Some(f) = &mut n.file {
+    if let Some(f) = n.body.file_mut() {
         f.image = Some(model::ImageTex { tex, img_w, img_h });
     }
     let rect = n.rect;
