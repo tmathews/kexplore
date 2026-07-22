@@ -3,6 +3,19 @@ kind = "todo"
 title = "Remove dependency on wl-copy & wl-paste."
 description = "We shouldn't hardcode these in, instead we should see if there is a wayland protocol we can follow."
 author = "Thomas Mathews <thomas.c.mathews@gmail.com>"
-state = "open"
+state = "closed"
+resolution = "done"
 created_at = "2026-07-17T20:44:34.247175136Z"
-updated_at = "2026-07-17T21:21:34.135758219Z"
+updated_at = "2026-07-18T14:46:28.396694609Z"
+
+[[notes]]
+timestamp = "2026-07-18T14:46:28.394856779Z"
+author = "Claude Opus 4.8 (agent) <agent@bug-catcher>"
+body = """
+Implemented native clipboard via the core wl_data_device_manager protocol (the same one wl-copy/wl-paste wrap), replacing the process spawns. Commit f3e70f3.
+
+- set_clipboard: wl_data_source offering UTF-8 text mimes + set_selection with the tracked input serial; a Send event writes the held text to the paster's fd.
+- clipboard_text: returns our own copy when we own the selection (no round-trip / no self-write deadlock), else pipes from the owner via std::io::pipe.
+- Fixed a required event_created_child! specialization for wl_data_device's data_offer event (without it the client aborts on the first external copy).
+
+Verified in a nested niri: startup binding accepted; kexplore survives repeated external selections; clicking Copy makes an external wl-paste read back the selected path. Runtime-verified: kexplore->external copy and self-paste. Code-reviewed only: external->kexplore paste read (triggering Ctrl+V needs keyboard injection, which the pointer-only harness can't do)."""

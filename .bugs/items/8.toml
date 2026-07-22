@@ -5,4 +5,25 @@ description = 'We should be able to open the app as a file selector and pick 1-n
 author = "Thomas Mathews <thomas.c.mathews@gmail.com>"
 state = "open"
 created_at = "2026-07-17T21:49:26.733592756Z"
-updated_at = "2026-07-17T21:50:31.663842853Z"
+updated_at = "2026-07-18T05:58:49.019598077Z"
+
+[[notes]]
+timestamp = "2026-07-18T05:58:49.019596564Z"
+author = "Claude Opus 4.8 (agent) <agent@bug-catcher>"
+body = """
+Approach (portal integration) — grounded in current code:
+
+GTK apps reach a file manager only through xdg-desktop-portal: GTK app --(GTK_USE_PORTAL=1)--> xdg-desktop-portal --(portals.conf)--> a backend implementing org.freedesktop.impl.portal.FileChooser (OpenFile/SaveFile/SaveFiles, returning file:// URIs). kexplore plugs in as that backend.
+
+Two layers:
+
+LAYER 1 — picker mode inside kexplore (needed regardless of glue):
+  - main() currently takes no CLI args (main.rs:108), always opens $HOME, and has no confirm-and-return path. ui.selection is a single (NodeId,usize) row.
+  - Add CLI flags --pick-file / --pick-files / --pick-dir / --save <name>, plus --out <path> and --start <dir>.
+  - Add picker chrome: an Open/Choose + Cancel bar; confirm on Enter/double-click; honor multiple/directory.
+  - Add multi-*file* (row) selection. NOTE: the marquee multi-select we shipped (25ec2f0) selects *nodes* (dir windows), not file rows — a picker needs a selected-row set instead. Same 'set + dashed highlight' idea, different target.
+  - On confirm write chosen file:// URIs to --out (or STDOUT per this item), exit 0; on cancel exit non-zero.
+
+LAYER 2 — portal glue. DECISION: use xdg-desktop-portal-termfilechooser (if installed) so we ship NO D-Bus service ourselves. It already implements the impl.FileChooser backend and shells out to a command with env vars (mode / multiple / save-name / an output file to write paths into). We provide a ~10-line wrapper that launches 'kexplore --pick…'. Then set in ~/.config/xdg-desktop-portal/portals.conf under [preferred]: org.freedesktop.impl.portal.FileChooser=termfilechooser. (A native zbus backend owning org.freedesktop.impl.portal.kexplore is the self-contained alternative for later; the picker mode doesn't change either way.)
+
+BLOCKED ON DESIGN: user wants to design the confirm/cancel interaction first before implementing. Pick up once that UX is settled."""

@@ -1,0 +1,148 @@
+id = 24
+kind = "todo"
+title = "Audio + video file previews; video via direct KMS-plane scanout (underlay)"
+description = """
+Support previewing audio and video files in file nodes (like the current image preview), with video buffered straight to a KMS plane via the compositor's direct scanout. Both kwm and niri support direct scanout AND underlay compositing.
+
+=== CURRENT PREVIEW PIPELINE (baseline) ===
+Built for ONE static frame uploaded ONCE:
+ - preview::previewable() gates on ext (png/jpg/jpeg/jfif/webp) — src/preview.rs:22
+ - double-click -> Tasks::spawn_preview worker -> decode() -> DecodedImage (RGBA8 premult) — src/tasks.rs:88
+ - main thread PreviewDone -> make_preview_texture (R8G8B8A8_UNORM) -> one PendingUpload -> attach ImageTex — src/main.rs:242
+ - sampled every frame, never touched again.
+
+Already in our favor:
+ - record_uploads supports RE-uploading into an existing texture (initialized:true path) — src/gfx/upload.rs. Streaming frames into one persistent texture needs no new GPU plumbing.
+ - Event loop already has continuous-repaint (animating flag + poll-timeout/deadline machinery for caret blink / key repeat) — src/main.rs:187,204. A playback clock extends this, not a rewrite.
+ - Tasks worker -> mpsc -> wake-pipe seam is a clean place to hang a decode thread.
+
+Two hard walls:
+ - NO audio output subsystem exists anywhere. Needs net-new real-time output thread (PipeWire/ALSA) + ring buffer + clock.
+ - Decoders emit YUV (NV12/YUV420); our textures are RGBA. Needs YUV->RGB (shader) or CPU convert — UNLESS we go direct-scanout (hardware does it, see below).
+
+=== AUDIO (modest; can stay 100% pure-Rust, no C deps) ===
+ - Decode: symphonia (MP3/AAC/FLAC/Vorbis/Opus/WAV), decode-only.
+ - Output: cpal (ALSA/PipeWire) — the net-new real-time audio thread.
+ - Visual: compute waveform PEAK TABLE on the decode thread, render as a STATIC texture through the existing upload path — elegant fit, no per-frame GPU work, only a moving playhead (animating flag already handles it).
+ - Transport UI: play/pause/seek, follows existing node/button patterns.
+ - ~5-8 pure-Rust crates. Few focused days. Also builds the audio-output subsystem video needs.
+
+=== VIDEO + DIRECT SCANOUT TO KMS PLANE (real requirement) ===
+Framing: a Wayland client NEVER touches KMS. Compositor holds DRM master and PROMOTES an eligible buffer to a hardware plane. Our job = make the video buffer eligible.
+
+Current surface (blocker): kexplore is ONE wl_surface rendered entirely through the Vulkan swapchain (VK_KHR_wayland_surface WSI). No wl_subcompositor, no zwp_linux_dmabuf_v1. Everything (UI + previews) is composited by our renderer into one buffer — which can NEVER be a video plane.
+
+Three eligibility requirements:
+ 1. Video must be its OWN surface, not composited into ours. Bind wl_subcompositor; a playing video is a wl_subsurface positioned over the file node, carrying its own buffer.
+ 2. Buffer must be a dmabuf in a plane-compatible format. Bind zwp_linux_dmabuf_v1 (v4); attach via zwp_linux_buffer_params_v1 (DRM-PRIME fd -> wl_buffer). Overlay/underlay planes scan out NV12 natively -> display controller does YUV->RGB AND scaling in fixed-function hw. The shader-conversion problem DISAPPEARS; we never touch the pixels.
+ 3. Allocate from the compositor's scanout tranche: zwp_linux_dmabuf_feedback_v1 gives per-surface feedback with a "scanout" tranche of formats/modifiers the plane accepts. Match it -> reliably promoted.
+
+Zero-copy pipeline:
+ VAAPI hw-decode (NV12 in dmabuf) -> export DRM-PRIME fd -> zwp_linux_buffer_params -> wl_buffer -> attach to video subsurface (scaled via wp_viewport, which we already use) -> compositor promotes to KMS plane -> hw does YUV->RGB + scale, no composite pass. Decoder straight to scanout; never enters our Vulkan renderer or a staging buffer.
+
+Design fit:
+ - Occlusion: planes are best-effort + scarce (1-3). Promoted when the video node is on top/unobstructed; silently falls back to composite when another floating node overlaps. Acceptable.
+ - Rounded/frosted corners (commits 36140d1, 1ef75ed): RESOLVED by UNDERLAY compositing (kwm + niri support it). Video goes on an underlay plane BELOW the composite; a translucent region in the parent surface lets it show through; rounded/frosted chrome is drawn normally in the composite ABOVE the plane; the plane stays a clean opaque rectangle. If underlay ever doesn't work out, redesign how the preview frame fits.
+
+libmpv vs FFmpeg (decided by the scanout requirement):
+ - Direct scanout requires FFmpeg/VAAPI + a hand-rolled dmabuf subsurface. Fits kexplore BETTER than libmpv because we already speak raw Wayland protocol by hand (no toolkit); we own DRM-PRIME export + subsurface in the same style as platform/wayland.rs.
+ - libmpv's only route to a plane is --vo=dmabuf-wayland (creates its own subsurface) — embedding it under our wl_display is fiddly and cedes a subsurface to mpv. Reject for the scanout path.
+
+Concrete additions:
+ - platform/wayland.rs: bind wl_subcompositor + zwp_linux_dmabuf_v1 (v4).
+ - New VideoSurface type: child wl_surface + wl_subsurface + own wp_viewport, sized/positioned to the node rect each frame (layout already computes rects).
+ - Decode thread on the Tasks/wake-pipe seam producing DRM-PRIME frames; main thread wraps as wl_buffer and commits on the subsurface with ITS OWN frame callbacks — DECOUPLED from swapchain repaint (video pacing must NOT gate on UI redraws, and must NOT go through the swapchain acquire/present path).
+ - Subscribe zwp_linux_dmabuf_feedback_v1 on the video surface; feed scanout tranche formats to the VAAPI allocator.
+ - A/V sync: wp_presentation feedback gives real on-screen timestamps to sync the audio clock.
+
+=== SEQUENCING ===
+ 1. Audio first (pure-Rust, self-contained; builds the audio subsystem video reuses).
+ 2. Video COMPOSITED first (demux/decode/subsurface/audio-sync working) — this also becomes the permanent fallback path, not throwaway.
+ 3. Layer dmabuf-feedback + NV12 direct scanout (underlay) as the optimization on top."""
+author = "Thomas Mathews <thomas.c.mathews@gmail.com>"
+state = "open"
+created_at = "2026-07-18T19:58:15.852091760Z"
+updated_at = "2026-07-19T16:33:54.885810735Z"
+
+[[notes]]
+timestamp = "2026-07-19T16:09:28.995185927Z"
+author = "Thomas Mathews <thomas.c.mathews@gmail.com>"
+body = """
+=== REFINEMENTS FROM RESEARCH PASS (corrections to the FFmpeg plan) ===
+
+Confirmed hardware: AMD Radeon 780M (Phoenix1, RDNA3 APU), Mesa radeonsi VA-API (vainfo OK). VA-API is native/first-class here -> it is the PRIMARY decode path; Vulkan Video is only a fallback.
+
+DECODE PATH — pick VA-API DRM-PRIME, NOT Vulkan-Video export:
+ - PRIMARY (matches our architecture; keeps video OUT of our Vulkan renderer):
+     libavcodec decodes to AV_PIX_FMT_VAAPI surface
+     -> av_hwframe_map to AV_PIX_FMT_DRM_PRIME -> AVDRMFrameDescriptor (dmabuf fds + DRM fourcc + MODIFIER)
+     -> zwp_linux_buffer_params -> wl_buffer -> video subsurface. No Vulkan, no VK_KHR_external_memory_fd.
+ - ALTERNATIVE (Vulkan Video): decode to AV_PIX_FMT_VULKAN (VkImage) then export via VK_KHR_external_memory_fd.
+   This PULLS decode into our VkDevice (more coupling) and is newer/less mature. Do NOT lead with this.
+   (An earlier research draft fused the VA-API data flow with the Vulkan-Video export call — they are two distinct pipelines.)
+
+NOT drmModePageFlip: we are a Wayland CLIENT. The compositor is DRM master and owns every page flip / plane assignment. Our ONLY path is zwp_linux_dmabuf + subsurface; the compositor promotes to a plane. drmModePageFlip / bare-metal KMS only applies to an app that is its own compositor — kexplore is not. Strike any "schedule onto overlay plane via drmModePageFlip" step.
+
+"ZERO-COPY" IS CONDITIONAL: the exported frame's DRM fourcc + MODIFIER must be in the plane's scanout tranche (zwp_linux_dmabuf_feedback_v1). AMD advertises DCC-compressed modifiers; if the plane rejects the decoder's modifier, the compositor silently copies/composites and scanout is lost. Match the tranche or negotiate a common modifier.
+
+DEPENDENCY LIST — corrected (system libs via `pacman -S ffmpeg`):
+ - libavformat  (demux)
+ - libavcodec   (decode + hw pipelines)
+ - libavutil    (MANDATORY — AVHWDeviceContext, av_hwdevice_ctx_create(VAAPI), av_hwframe_map, AV_PIX_FMT_DRM_PRIME, hwcontext_drm.h all live here)
+ - libswresample (audio PCM resample/convert — the audio branch needs it)
+ - libswscale    (ONLY for the composited fallback / CPU scale; not needed on the pure hw path)
+ Rust wrapper: ffmpeg-next or rsmpeg. RISK: high-level wrappers may not cleanly surface av_hwframe_map / DRM-PRIME / AVDRMFrameDescriptor; budget for dropping to the -sys FFI for the export step. rsmpeg is closer to raw FFI and may be the safer pick for the hwcontext work.
+
+A/V SYNC — concrete algorithm (audio-as-master), corrected present mechanism:
+ - Master clock = audio: T_audio = current sample PTS adjusted for cpal-reported output latency. (When there is NO audio track — video-only preview — fall back to a monotonic wall clock.)
+ - Per video frame vs master: too early (delta beyond ~a frame interval) -> hold; on time -> PRESENT; lagging -> DROP to catch up. Thresholds tunable; cap present cadence to display refresh.
+ - PRESENT here = COMMIT the dmabuf wl_buffer on the video subsurface, paced by the subsurface's frame callbacks + wp_presentation feedback. It is NOT a thread-sleep-then-drmModePageFlip. Decoupled from swapchain repaint (already noted).
+
+LICENSING: decode-only + VAAPI stays LGPL (dynamic link). Avoid GPL-only components (e.g. x264) since we only decode.
+
+libmpv rejection — corroborated. Sharpest reason is not "context deadlocks" but: libmpv has no first-class Vulkan render target, and we don't want mpv to render at all — we want the raw dmabuf for the compositor to scan out. Its only route to that is --vo=dmabuf-wayland (fiddly to embed). Stands."""
+
+[[notes]]
+timestamp = "2026-07-19T16:14:25.013920289Z"
+author = "Thomas Mathews <thomas.c.mathews@gmail.com>"
+body = """
+=== NVIDIA ASSESSMENT + TWO ACCURACY CORRECTIONS (review pass) ===
+
+NVIDIA + VA-API ROUTE: yes, this is a hard time. Verified against current sources (elFarto/nvidia-vaapi-driver README, 2026):
+ - NVIDIA's proprietary driver has NO native VA-API. The only bridge is elFarto's nvidia-vaapi-driver, a third-party shim over NVDEC, which states it is "specifically designed to be used by Firefox... may not operate correctly in other applications."
+ - Its EGL backend is BROKEN on driver 525+ (upstream regression); the replacement "direct" backend is experimental and needs NVD_BACKEND=direct + LIBVA_DRIVER_NAME=nvidia env plumbing. Fragile across driver releases.
+ - Its dmabuf export is shaped for browser COMPOSITING consumption (multi-plane YUV exported as a single buffer, one modifier — what Chromium's vaapi_wrapper wants), not for KMS scanout. Combined with desktop NVIDIA's historically poor NV12 overlay-plane support, scanout promotion of these buffers is unlikely — the compositor would import + composite instead.
+ - NET: on NVIDIA the zero-copy scanout premise collapses to our composited fallback anyway. The NVIDIA-native decode path would be Vulkan Video (first-class on NVIDIA, AV_PIX_FMT_VULKAN) or NVDEC/CUDA — i.e. the ticket's "alternative" path becomes primary there.
+
+DECISION: NVIDIA support is a NON-GOAL for the scanout feature. This is a personal tool running under kwm/niri on an AMD APU (780M/radeonsi). Design consequence that keeps the door open for free: the decode->present seam must be "frame = dmabuf fds + DRM fourcc + modifier + PTS", NOT "frame = VASurface". Any backend (VA-API, Vulkan Video, sw-decode+linear-dmabuf) can fill that contract later; only the VA-API filler gets built now. If the promotion fails or the backend can't export, we land on the composited path, which is the permanent fallback regardless.
+
+CORRECTION 1 (prior comment overstated): "AMD advertises DCC-compressed modifiers" — DCC applies to render targets; VCN DECODE output is NOT DCC-compressed (typically GFX9+ tiled or linear NV12). The real tranche-mismatch risk on AMD is TILED-vs-LINEAR: the decoder emits a tiled modifier and the scanout tranche may want linear (or a different swizzle). Risk stands, mechanism corrected. The spike (decode one frame, print fourcc+modifier, diff against the scanout tranche) answers this empirically either way.
+
+CORRECTION 2 (audio scope nuance): symphonia's AAC support is AAC-LC only — no HE-AAC/SBR. Most .m4a files are AAC-LC so this is acceptable for previews; note it so a silent HE-AAC file isn't chased as a bug later."""
+
+[[notes]]
+timestamp = "2026-07-19T16:33:54.883181965Z"
+author = "Thomas Mathews <thomas.c.mathews@gmail.com>"
+body = """
+=== STRATEGY REVISION: Vulkan Video promoted to PRIMARY (supersedes "VA-API primary" + "NVIDIA non-goal") ===
+
+New context: target machines are THREE — Intel laptop, AMD laptop (780M), NVIDIA gaming PC. Goal: one simplified decode implementation on all three. Vulkan Video is the one standard that does that; nvidia-vaapi-driver (fragile Firefox-targeted shim) is off the table entirely.
+
+COMPLEXITY RESOLVED — we do not write raw Vulkan Video:
+ - Raw API (sessions, SPS/PPS parameter objects, DPB/reference-slot management, video queues) is thousands of lines — but libavcodec's Vulkan hwaccel IS that code.
+ - App-side is the same shape as the VA-API path: av_hwdevice_ctx_create(VULKAN) instead of (VAAPI), pick AV_PIX_FMT_VULKAN in get_format, av_hwframe_map -> AV_PIX_FMT_DRM_PRIME. Backend difference ~ a constant + a pixel format; both end at the same seam (dmabuf fds + fourcc + modifier + PTS).
+ - hwcontext_vulkan carries VK_EXT_external_memory_dma_buf + VK_EXT_image_drm_format_modifier for the dmabuf crossing.
+ - COUPLING: FFmpeg creates its OWN private VkDevice on the decode thread. The renderer's VkDevice is untouched. "Pull decode into our VkDevice" is only an optional future optimization (zero-import sampling in the composited fallback), NOT a cost of adoption.
+
+DRIVER STATUS (verified 2026-07):
+ - NVIDIA proprietary: most mature Vulkan Video implementation. No shim, no env vars.
+ - RADV (AMD): decode default-ON (flag inverted to RADV_PERFTEST_NO_VIDEO_DECODE); H.264/H.265/AV1.
+ - ANV (Intel): H.264/H.265 merged, default-on, CTS-passing; AV1 decode in progress. Intel VA-API (gold standard) as fallback.
+ - Needs recent FFmpeg (7.x) + recent Mesa. Distro caveat: some distros build Mesa without patented codecs (Fedora -> freeworld pkgs); Arch is fine.
+
+REVISED PLAN:
+ - PRIMARY backend: FFmpeg + Vulkan Video hwaccel on a private VkDevice, all three machines.
+ - FALLBACK knob (env/config): hwdevice VAAPI on Intel/AMD (identical seam, ~constant swap). Keep the VA-API notes above as the fallback recipe, incl. the Radeon 780M vainfo confirmation.
+ - NVIDIA back IN scope for decode. Scanout promotion remains per-machine best-effort: likely on AMD/Intel under kwm/niri, unlikely on desktop NVIDIA (compositor composites — but composited NATIVE decode, no shim).
+ - Spike updated: per machine x backend, decode one frame, print fourcc+modifier, diff against zwp_linux_dmabuf_feedback scanout tranche. Also validates av_hwframe_map(VULKAN -> DRM_PRIME) per driver, the one step whose per-driver behavior we haven't proven.
+ - Everything downstream of the seam (subsurface, tranche match, underlay, A/V sync, composited fallback) unchanged by this revision."""

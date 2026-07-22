@@ -1,0 +1,11 @@
+id = 23
+kind = "todo"
+title = "Remove excess buttons from top bar"
+description = """
+The following can now be done via context menu:
+ - terminal
+ - copy path"""
+author = "Thomas Mathews <thomas.c.mathews@gmail.com>"
+state = "open"
+created_at = "2026-07-18T18:32:08.686338812Z"
+updated_at = "2026-07-18T18:32:52.043567922Z"

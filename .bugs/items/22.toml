@@ -1,0 +1,14 @@
+id = 22
+kind = "todo"
+title = "Two blur passes: toolbar frosts nodes, nodes frost background"
+description = """
+The frosted blur has one source. After moving nodes to the overlay for per-node blur (commit a153d20), the scene (blur source) holds only the background (grid + connector wires). Consequence: the toolbar's frosted band now reflects the background rather than the node content behind it, a minor regression from when the whole scene was the blur source.
+
+To have BOTH — the toolbar frosting node content AND nodes frosting only the background behind them — needs two blur passes / two sources:
+  - Blur A = full scene (grid + connectors + nodes) -> sampled by the toolbar band (as before).
+  - Blur B = background only (grid + connectors) -> sampled by each node's backdrop.
+This means a second offscreen target + second separable blur in src/gfx/blur.rs, a second Blur descriptor slot in renderer2d TexSlot/TexSets, and wiring in gfx/mod.rs record(). Deferred; low priority (the current single-source look is acceptable)."""
+author = "Claude Opus 4.8 (agent) <agent@bug-catcher>"
+state = "open"
+created_at = "2026-07-18T18:09:07.896250025Z"
+updated_at = "2026-07-18T18:09:07.896251107Z"
